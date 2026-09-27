@@ -106,11 +106,12 @@ jobs:
           echo "Check the URL, and that the service is deployed."
           exit 1
 
+      # A plain install, including devDependencies — that is where the Capacitor
+      # packages live. They must be in package.json: the Capacitor CLI finds
+      # plugins by reading it, so installing them with --no-save leaves them on
+      # disk but invisible, and the APK comes out with no notification code.
       - name: Install dependencies
-        run: |
-          npm install --no-audit --no-fund
-          npm install --no-save @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets@3 \
-            @capacitor/local-notifications@6 @capacitor/app@6
+        run: npm install --no-audit --no-fund
 
       - name: Create the native project
         run: '[ -d android ] || npx cap add android'
@@ -120,6 +121,9 @@ jobs:
 
       - name: Sync
         run: npx cap sync android
+
+      - name: Check plugins registered, add notification permissions
+        run: node scripts/patch-android-manifest.js
 
       - name: Assemble debug APK
         run: |
