@@ -53,9 +53,12 @@ cat > public/config.js <<CONFIG
 window.HOMEBOARD_API = "$APP_URL";
 CONFIG
 
-echo "==> Installing Capacitor"
-npm install --no-save @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets@3 \
-  @capacitor/local-notifications@6 @capacitor/app@6
+# A plain install pulls in the Capacitor packages from devDependencies. They
+# have to be in package.json — the CLI discovers plugins by reading it, and a
+# --no-save install leaves them invisible, producing an APK that cannot post
+# a notification at all.
+echo "==> Installing dependencies"
+npm install --no-audit --no-fund
 
 echo "==> Creating the android/ project"
 [ -d android ] || npx cap add android
@@ -65,6 +68,9 @@ npx @capacitor/assets generate --android --assetPath resources
 
 echo "==> Syncing web assets"
 npx cap sync android
+
+echo "==> Checking plugins and notification permissions"
+node scripts/patch-android-manifest.js
 
 cat <<'DONE'
 

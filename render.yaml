@@ -4,7 +4,8 @@ services:
     runtime: node
     plan: free
     region: singapore
-    buildCommand: npm install
+    # --omit=dev skips the Capacitor packages, which are only for building the APK
+    buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /api/health
     autoDeploy: true

@@ -214,8 +214,33 @@ running. In a browser they use the Notifications API, which can only fire while 
 the toggle's own description says which one you're getting, so nobody is promised something the
 platform won't deliver. Install the app if you want reminders that always arrive.
 
-The APK build adds `@capacitor/local-notifications` and `@capacitor/app` for this and for the
-Android back button. Both are pulled in at build time; there is nothing to install by hand.
+The Capacitor packages live in `devDependencies`, which matters more than it sounds: **the
+Capacitor CLI discovers plugins by reading `package.json`**. Installing them with `--no-save` leaves
+them in `node_modules` but invisible to the CLI, and you get an APK with no notification code in it
+at all — at which point Android greys out the "Allow notifications" switch in system settings,
+because the app declares no way to post one. `scripts/patch-android-manifest.js` runs in the build
+and fails it if the plugins did not register, so that cannot happen again.
+
+That script also adds the permissions Capacitor's own manifests leave out, chiefly
+`SCHEDULE_EXACT_ALARM`. Without it Android 12 and later downgrade a scheduled reminder to an inexact
+alarm that can land many minutes late. With it, the app can ask for "Alarms & reminders" and
+reminders arrive on the minute — and if that is off, HomeBoard says reminders may be late rather
+than quietly being late.
+
+Render never needs any of this, so `render.yaml` builds with `npm install --omit=dev`.
+
+<details>
+<summary><strong>If "Allow notifications" is greyed out in Android settings</strong></summary>
+
+That means the installed APK declares no notification permission — it was built before this was
+fixed. Rebuild from the current workflow and reinstall. You can confirm a good build from the
+workflow log: the "Check plugins registered" step prints
+
+```
+Plugins registered: @capacitor/app, @capacitor/local-notifications
+Manifest now declares: SCHEDULE_EXACT_ALARM, POST_NOTIFICATIONS, RECEIVE_BOOT_COMPLETED, VIBRATE, INTERNET
+```
+</details>
 
 ### 7. The cold start, and what to do about it
 
@@ -282,6 +307,9 @@ Two more suites:
 npm run test:store   # the GitHub datastore against a fake Contents API —
                      # sha conflicts, 20 concurrent writers, queue recovery
 npm run test:qr      # the QR encoder against verified golden matrices
+npm run test:reminders  # the Android reminder flow against a stand-in plugin —
+                     # permission granted, refused, already denied, revoked,
+                     # and exact alarms disallowed
 npm run test:ui      # 42 real browser assertions through the whole UI
                      # (needs: npm i --no-save playwright && npx playwright install chromium)
 ```
@@ -392,6 +420,8 @@ scripts/
   smoke-test.js     30 end-to-end API assertions
   store-test.js     GitHub datastore under conflict + concurrency
   qr-test.js        QR encoder against verified golden matrices
+  reminders-test.js Android reminder flow, plugin stood in for
+  patch-android-manifest.js  checks plugins registered, adds alarm permissions
   ui-test.js        21 browser assertions through the real UI
   android-sim.js    stands in for the APK — own origin, sleeping host
   setup-android.sh  builds the native project

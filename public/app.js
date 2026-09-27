@@ -951,6 +951,7 @@ $('#theme-seg').addEventListener('click', (e) => {
 });
 
 $('#open-account').addEventListener('click', () => {
+  syncRemindersToggle();
   const av = $('#acct-avatar');
   av.style.background = state.user.avatarColor || '#0f766e';
   av.textContent = initials(state.user.name);
@@ -1157,32 +1158,95 @@ async function clearNative(ln) {
 }
 
 async function setReminders(on) {
+  const toggle = $('#reminders-toggle');
+
   if (!on) {
     localStorage.setItem('hb.reminders', '0');
     await scheduleReminders();
-    $('#reminders-toggle').checked = false;
+    toggle.checked = false;
     updateRemindersNote();
     return;
   }
 
   const ln = localNotifications();
   let granted = false;
+
   if (ln) {
-    const res = await ln.requestPermissions();
-    granted = res?.display === 'granted';
+    // Android 13 and later show the system prompt here. If the person has
+    // already said no once, requestPermissions returns 'denied' without asking
+    // again — the only way back is the app's settings screen.
+    let state = (await ln.checkPermissions())?.display;
+    if (state === 'prompt' || state === 'prompt-with-rationale') {
+      state = (await ln.requestPermissions())?.display;
+    }
+    granted = state === 'granted';
   } else if ('Notification' in window) {
-    granted = (await Notification.requestPermission()) === 'granted';
+    granted = Notification.permission === 'granted'
+      || (await Notification.requestPermission()) === 'granted';
+  } else {
+    toggle.checked = false;
+    toast('This browser cannot show notifications.');
+    return;
   }
 
   if (!granted) {
-    $('#reminders-toggle').checked = false;
-    toast('Notifications are blocked. Turn them on for HomeBoard in your device settings.');
+    toggle.checked = false;
+    localStorage.setItem('hb.reminders', '0');
+    toast(
+      ln
+        ? 'Android is blocking notifications for HomeBoard. Turn them on in Settings → Apps → HomeBoard → Notifications, then try again.'
+        : 'Your browser is blocking notifications for this site. Allow them in the padlock menu, then try again.',
+      null, 7000
+    );
     return;
   }
+
   localStorage.setItem('hb.reminders', '1');
+  toggle.checked = true;
   await scheduleReminders();
   updateRemindersNote();
+
+  // Granted, but Android 12+ still downgrades the alarm unless "Alarms &
+  // reminders" is allowed. Better to say so than to quietly be ten minutes late.
+  if (ln?.checkExactNotificationSetting) {
+    try {
+      const exact = await ln.checkExactNotificationSetting();
+      if (exact?.exact_alarm !== 'granted') {
+        toast('Reminders on — but they may arrive late.', {
+          label: 'Fix',
+          run: async () => {
+            try { await ln.changeExactNotificationSetting(); } catch {}
+          },
+        });
+        return;
+      }
+    } catch { /* older plugin builds don't have this; not worth failing over */ }
+  }
   toast('Reminders on.');
+}
+
+/**
+ * The switch has to reflect the operating system, not just what we saved.
+ * Someone can revoke notifications in Android settings while the app is closed,
+ * and coming back to a switch that still says "on" would be a lie.
+ */
+async function syncRemindersToggle() {
+  const toggle = $('#reminders-toggle');
+  if (!toggle) return;
+  let osAllows = true;
+  const ln = localNotifications();
+  try {
+    if (ln) osAllows = (await ln.checkPermissions())?.display === 'granted';
+    else if ('Notification' in window) osAllows = Notification.permission === 'granted';
+    else osAllows = false;
+  } catch { osAllows = false; }
+
+  if (!osAllows && remindersOn()) {
+    localStorage.setItem('hb.reminders', '0');
+    await scheduleReminders();
+  }
+  toggle.checked = remindersOn() && osAllows;
+  updateRemindersNote();
 }
 
 function updateRemindersNote() {
@@ -1302,8 +1366,7 @@ async function boot() {
   $('#app-screen').classList.remove('hidden');
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
   $('#my-avatar').textContent = initials(state.user.name);
-  $('#reminders-toggle').checked = remindersOn();
-  updateRemindersNote();
+  await syncRemindersToggle();
   await loadAll();
   await consumePendingJoin();
   scheduleReminders();
