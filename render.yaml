@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: homeboard
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: DATA_REPO
+        sync: false
+      - key: DATA_BRANCH
+        value: main
+      - key: DATA_DIR
+        value: data

@@ -1,0 +1,28 @@
+{
+  "name": "homeboard",
+  "version": "1.0.0",
+  "description": "HomeBoard \u2014 push to-do actions to the people you live with. Shared household task board with live countdowns.",
+  "main": "server/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "smoke": "node scripts/smoke-test.js",
+    "cap:sync": "npx cap sync android",
+    "cap:open": "npx cap open android",
+    "test:store": "node scripts/store-test.js",
+    "test:ui": "node scripts/ui-test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HomeBoard — shared tasks for the people you live with</title>
+<meta name="description" content="Push to-dos to the people you live with. Shared boards, live countdowns, and details that delete themselves the moment a task is done.">
+<meta name="theme-color" content="#0f766e">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-32.png" sizes="32x32">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="HomeBoard">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;750&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<!-- ============ AUTH ============ -->
+<div id="auth-screen">
+  <div class="auth-card">
+    <div class="brand">
+      <img src="/icons/icon-192.png" alt="" width="62" height="62">
+      <h1>HomeBoard</h1>
+      <p>Shared to-dos for the people you live with.</p>
+    </div>
+
+    <div class="auth-tabs" role="tablist">
+      <button role="tab" id="tab-signin" aria-selected="true">Sign in</button>
+      <button role="tab" id="tab-signup" aria-selected="false">Create account</button>
+    </div>
+
+    <div id="auth-alert" class="alert alert-error hidden" role="alert"></div>
+
+    <form id="auth-form" novalidate>
+      <label class="field" id="name-field" hidden>
+        <span>Your name</span>
+        <input class="input" name="name" autocomplete="name" placeholder="Ajay">
+      </label>
+      <label class="field">
+        <span>Email</span>
+        <input class="input" name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input class="input" name="password" type="password" autocomplete="current-password" placeholder="At least 8 characters" required>
+      </label>
+      <button class="btn btn-primary btn-block" type="submit" id="auth-submit">Sign in</button>
+    </form>
+
+    <p class="auth-note" id="auth-note">
+      Got a join code from someone? Create your account first, then enter the code on the next screen.
+    </p>
+  </div>
+</div>
+
+<!-- ============ APP ============ -->
+<div id="app-screen" class="hidden">
+  <header class="topbar">
+    <img class="logo" src="/icons/icon-192.png" alt="">
+    <button class="board-switch" id="board-switch">
+      <span class="nm" id="board-name">Loading…</span>
+      <svg width="12" height="8" viewBox="0 0 12 8" fill="none" aria-hidden="true"><path d="M1 1l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <button class="btn btn-ghost btn-sm" id="open-members" title="People on this board">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+    </button>
+    <button class="btn btn-ghost btn-sm" id="open-account" title="Account">
+      <span class="avatar sm" id="my-avatar">?</span>
+    </button>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-view="mine" aria-selected="true">For me <span class="count" id="c-mine">0</span></button>
+    <button role="tab" data-view="all" aria-selected="false">Whole board <span class="count" id="c-all">0</span></button>
+    <button role="tab" data-view="sent" aria-selected="false">I assigned <span class="count" id="c-sent">0</span></button>
+    <button role="tab" data-view="done" aria-selected="false">Finished</button>
+  </nav>
+
+  <main>
+    <div id="install-banner" class="install hidden">
+      <img src="/icons/icon-192.png" alt="" width="34" height="34" style="border-radius:9px">
+      <p><strong>Add HomeBoard to your home screen</strong><br>Runs full-screen, works offline.</p>
+      <button class="btn btn-primary btn-sm" id="install-btn">Install</button>
+      <button class="btn btn-ghost btn-sm" id="install-dismiss" aria-label="Dismiss">✕</button>
+    </div>
+    <div id="view"><div class="center-load"><span class="spinner"></span></div></div>
+  </main>
+
+  <button class="fab" id="fab" aria-label="New task">
+    <svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+</div>
+
+<!-- ============ SHEETS ============ -->
+<div class="scrim" id="scrim"></div>
+
+<!-- new / edit task -->
+<section class="sheet" id="sheet-task" role="dialog" aria-modal="true" aria-labelledby="task-sheet-title">
+  <div class="grip"></div>
+  <div class="sheet-head">
+    <h2 id="task-sheet-title">New task</h2>
+    <button class="close-x" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body">
+    <form id="task-form">
+      <label class="field">
+        <span>Task</span>
+        <input class="input" name="title" placeholder="Take the bins out" maxlength="120" required>
+      </label>
+
+      <div class="field">
+        <span>Who's doing it</span>
+        <div class="people" id="assignee-picker"></div>
+      </div>
+
+      <div class="field">
+        <span>Due</span>
+        <input class="input" name="dueAt" type="datetime-local">
+        <div class="quick">
+          <button type="button" data-in="1">In 1 hour</button>
+          <button type="button" data-in="3">In 3 hours</button>
+          <button type="button" data-tonight="1">Tonight 8pm</button>
+          <button type="button" data-days="1">Tomorrow 6pm</button>
+          <button type="button" data-days="7">Next week</button>
+          <button type="button" data-clear="1">No deadline</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <span>Priority</span>
+        <div class="seg" id="priority-seg">
+          <button type="button" data-v="low" aria-pressed="false">Low</button>
+          <button type="button" data-v="normal" aria-pressed="true">Normal</button>
+          <button type="button" data-v="high" aria-pressed="false">High</button>
+        </div>
+      </div>
+
+      <label class="field">
+        <span>Details</span>
+        <textarea class="textarea" name="details" maxlength="4000" placeholder="Anything they need to know — where things are, what to buy, how you like it done."></textarea>
+      </label>
+
+      <div class="field">
+        <span>Steps (optional)</span>
+        <div class="checks" id="checklist-edit"></div>
+        <div class="quick" style="margin-top:8px">
+          <button type="button" id="add-check">+ Add a step</button>
+        </div>
+      </div>
+    </form>
+  </div>
+  <div class="sheet-foot">
+    <button class="btn" data-close style="flex:0 0 auto">Cancel</button>
+    <button class="btn btn-primary" id="task-save" style="flex:1">Create task</button>
+  </div>
+</section>
+
+<!-- task detail -->
+<section class="sheet" id="sheet-detail" role="dialog" aria-modal="true" aria-labelledby="detail-heading">
+  <div class="grip"></div>
+  <div class="sheet-head">
+    <h2 id="detail-heading">Task</h2>
+    <button class="btn btn-ghost btn-sm" id="detail-edit">Edit</button>
+    <button class="close-x" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body" id="detail-body"></div>
+  <div class="sheet-foot">
+    <button class="btn btn-danger" id="detail-delete" style="flex:0 0 auto">Delete</button>
+    <button class="btn btn-primary" id="detail-complete" style="flex:1">Mark done</button>
+  </div>
+</section>
+
+<!-- boards -->
+<section class="sheet" id="sheet-boards" role="dialog" aria-modal="true" aria-labelledby="boards-heading">
+  <div class="grip"></div>
+  <div class="sheet-head">
+    <h2 id="boards-heading">Your boards</h2>
+    <button class="close-x" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body">
+    <div id="board-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:22px"></div>
+    <div class="detail-block">
+      <h4>Start a new board</h4>
+      <form id="new-board-form" class="row">
+        <input class="input" name="name" placeholder="Home, Flat 3B, Weekend jobs…" maxlength="60" required>
+        <button class="btn btn-primary" type="submit" style="flex:0 0 auto">Create</button>
+      </form>
+    </div>
+    <div class="detail-block">
+      <h4>Join someone's board</h4>
+      <form id="join-form" class="row">
+        <input class="input" name="code" placeholder="ABCD-1234" maxlength="12" style="text-transform:uppercase" required>
+        <button class="btn" type="submit" style="flex:0 0 auto">Join</button>
+      </form>
+    </div>
+  </div>
+</section>
+
+<!-- members / invite -->
+<section class="sheet" id="sheet-members" role="dialog" aria-modal="true" aria-labelledby="members-heading">
+  <div class="grip"></div>
+  <div class="sheet-head">
+    <h2 id="members-heading">People</h2>
+    <button class="close-x" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body">
+    <div class="detail-block">
+      <h4>On this board</h4>
+      <div id="member-list"></div>
+    </div>
+    <div class="detail-block">
+      <h4>Invite someone</h4>
+      <form id="invite-form" class="row" style="margin-bottom:12px">
+        <input class="input" name="email" type="email" placeholder="their@email.com">
+        <button class="btn btn-primary" type="submit" style="flex:0 0 auto">Invite</button>
+      </form>
+      <div id="invite-alert" class="alert alert-ok hidden"></div>
+      <p style="font-size:12.5px;color:var(--ink-3);margin:0 0 9px">Or share the join code — anyone with it can join this board.</p>
+      <div class="code-box">
+        <code id="invite-code">————</code>
+        <button class="btn btn-sm" id="copy-code">Copy</button>
+      </div>
+      <button class="btn btn-ghost btn-sm" id="rotate-code" style="margin-top:9px">Reset code</button>
+    </div>
+    <div class="detail-block" id="danger-block">
+      <h4>Board settings</h4>
+      <button class="btn btn-danger btn-block" id="delete-board">Delete this board</button>
+    </div>
+  </div>
+</section>
+
+<!-- account -->
+<section class="sheet" id="sheet-account" role="dialog" aria-modal="true" aria-labelledby="account-heading">
+  <div class="grip"></div>
+  <div class="sheet-head">
+    <h2 id="account-heading">Account</h2>
+    <button class="close-x" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body">
+    <div style="display:flex;align-items:center;gap:13px;margin-bottom:22px">
+      <span class="avatar lg" id="acct-avatar">?</span>
+      <div style="min-width:0">
+        <div style="font-weight:650;font-size:16px" id="acct-name"></div>
+        <div style="font-size:13px;color:var(--ink-3)" id="acct-email"></div>
+      </div>
+    </div>
+    <div class="detail-block">
+      <h4>Appearance</h4>
+      <div class="seg" id="theme-seg">
+        <button type="button" data-v="" aria-pressed="true">System</button>
+        <button type="button" data-v="light" aria-pressed="false">Light</button>
+        <button type="button" data-v="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>
+    <button class="btn btn-block" id="signout-btn">Sign out</button>
+    <p style="font-size:11.5px;color:var(--ink-3);text-align:center;margin:18px 0 0;line-height:1.6">
+      HomeBoard · when a task is marked done its details, steps and notes are deleted for good — only the name is kept.
+    </p>
+  </div>
+</section>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>
