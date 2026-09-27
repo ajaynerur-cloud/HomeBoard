@@ -114,7 +114,9 @@ Copy the token. It is shown once.
 Open the Render URL in Chrome on the phone → menu (⋮) → **Add to Home screen**.
 HomeBoard will also show its own install banner the first time.
 
-It then runs full-screen with its own icon, and opens offline.
+Once installed it runs full-screen with its own icon. The app shell is cached on
+the device, so it opens straight into HomeBoard even when the server is asleep —
+you get HomeBoard's own waking screen, not the host's.
 
 ### 5. (Optional) Build a real APK
 
@@ -126,17 +128,98 @@ Your repo → **Actions** → **Build Android APK** → **Run workflow** → pas
 Render URL → run it. About four minutes later, download `HomeBoard-debug-apk`
 from the run's Artifacts. Transfer to the phone and open it.
 
+The build checks `/api/health` on the URL you give it before it builds anything,
+so a typo fails the workflow in thirty seconds instead of producing an APK that
+can never sign anyone in.
+
 **Or locally**, with Android Studio installed:
 
 ```bash
-# put your Render URL in capacitor.config.json → server.url first
-./scripts/setup-android.sh
+./scripts/setup-android.sh https://your-homeboard.onrender.com
 cd android && ./gradlew assembleDebug
 # → android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 For Play Store you'll need `assembleRelease` with your own signing key — the
 debug APK is for sideloading only.
+
+#### How the APK is put together
+
+The APK **bundles its own copy of the web app** and loads it from
+`https://localhost` inside the WebView. It does not point the WebView at your
+server. It only calls your server for the API, using the URL written into
+`public/config.js` at build time.
+
+That one decision is what keeps the host's cold-start page off your screen: the
+UI is already on the phone, so the app draws instantly and shows its own waking
+screen while the first API call brings the server back. It also means auth has
+to be token-based rather than cookie-based across that origin boundary, which is
+why the app stores a bearer token — cookies would be dropped.
+
+`public/config.js` is empty in the repo, which is correct for the web version
+(same origin, no base URL needed). The Android build rewrites it. If you run
+`setup-android.sh` locally, put it back before committing:
+
+```bash
+git checkout public/config.js
+```
+
+<details>
+<summary><strong>If the build fails at "sdkmanager failed with exit code 1"</strong></summary>
+
+You're on an old copy of `.github/workflows/android.yml`. Google removed the
+legacy `tools` SDK package in September 2026, and `android-actions/setup-android@v3`
+still asks for it by default, so that step fails on every run regardless of your
+project.
+
+The workflow in this repo no longer uses that action — `ubuntu-latest` already
+ships the Android SDK at `/usr/local/lib/android/sdk`, and the Android Gradle
+Plugin downloads whatever platform and build-tools it needs. Replace your
+workflow file with the current one and re-run.
+
+If you'd rather keep the action, the minimal patch is to stop it requesting the
+dead package:
+
+```yaml
+- uses: android-actions/setup-android@v3
+  with:
+    packages: 'platform-tools'
+```
+</details>
+
+### 6. The cold start, and what to do about it
+
+A free Render service spins down after about 15 minutes with no traffic. The
+next request wakes it, which takes 30–50 seconds, and while that happens Render
+serves **its own holding page** — the black "SERVICE WAKING UP" screen. That page
+comes from Render's edge before your app is running, so no amount of application
+code can replace it on a first-ever visit.
+
+What this repo does about it:
+
+| Where | What you see |
+|---|---|
+| Installed PWA, or any repeat visit | HomeBoard opens instantly from the device cache, then shows **HomeBoard's** waking screen while the API comes back. Render's page never renders. |
+| The APK | Same — the UI is bundled in the app. |
+| First-ever visit in a browser, service asleep | Render's holding page for ~40 seconds. Unavoidable on the free plan. |
+
+To remove even that last case, keep the service from sleeping:
+
+1. Repo → **Settings → Secrets and variables → Actions → Variables** → add
+   `HOMEBOARD_URL` = your live URL.
+2. Repo → **Actions** → enable **Keep HomeBoard awake**.
+
+It pings `/api/health` every ten minutes.
+
+> **Read this before you enable it.** A free Render account gets 750
+> instance-hours a month and a month is about 730 hours, so keeping *one*
+> service awake round the clock just fits. If you run a second free service on
+> the same account, you will exhaust the allowance partway through the month and
+> **both** will stop until it resets. With two or more, either leave the pinger
+> off or move to a paid instance, which doesn't sleep at all.
+>
+> GitHub also disables scheduled workflows after 60 days with no commits to the
+> repo, and its cron can run late under load. It's a workaround, not a guarantee.
 
 ---
 
@@ -168,8 +251,23 @@ Two more suites:
 npm run test:store   # the GitHub datastore against a fake Contents API —
                      # sha conflicts, 20 concurrent writers, queue recovery
 npm run test:ui      # 21 real browser assertions through the whole UI
-                     # (needs: npm i --no-save playwright)
+                     # (needs: npm i --no-save playwright && npx playwright install chromium)
 ```
+
+To check the mobile build's behaviour without building an APK:
+
+```bash
+# terminal 1
+APP_ORIGIN=http://localhost:3200 PORT=3100 npm start
+# terminal 2
+SLEEPY=3 npm run test:android
+# then open http://localhost:3200
+```
+
+That serves the app on its own origin, the way Capacitor serves it from
+`https://localhost`, and routes the API through a proxy that plays dead for the
+first three requests. You should see HomeBoard's waking screen, never a holding
+page, and signup should go through once the proxy stops.
 
 ---
 
@@ -248,17 +346,20 @@ public/
   index.html        the whole UI shell
   app.js            front end — vanilla JS, no framework, no build step
   app.css           design system, light + dark
-  sw.js             offline shell cache
+  sw.js             offline shell cache (serves the shell before the network)
+  config.js         API base URL — empty for web, written by the Android build
   manifest.webmanifest
   icons/
 scripts/
   smoke-test.js     30 end-to-end API assertions
   store-test.js     GitHub datastore under conflict + concurrency
   ui-test.js        21 browser assertions through the real UI
+  android-sim.js    stands in for the APK — own origin, sleeping host
   setup-android.sh  builds the native project
 resources/          1024px icon + splash, used for the Android build
 .github/workflows/
   android.yml       cloud APK build
+  keep-warm.yml     optional pinger that stops the free service sleeping
 render.yaml         Render deploy config
 capacitor.config.json
 ```

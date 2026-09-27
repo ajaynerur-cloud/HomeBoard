@@ -2,9 +2,9 @@
    App shell is cached so it opens instantly and works offline.
    API calls always go to the network — task data must never be stale. */
 
-const VERSION = 'homeboard-v1';
+const VERSION = 'homeboard-v2';
 const SHELL = [
-  '/', '/index.html', '/app.css', '/app.js', '/manifest.webmanifest',
+  '/', '/index.html', '/app.css', '/app.js', '/config.js', '/manifest.webmanifest',
   '/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon-32.png', '/icons/icon.svg',
 ];
 
@@ -30,10 +30,26 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith('/api/')) return;   // never cache task data
 
-  // Navigations: network first, fall back to the cached shell when offline.
+  // Navigations: serve the cached shell first, then refresh it in the
+  // background. This is what stops a sleeping server's holding page from ever
+  // becoming the app you see — the shell is already on the device, and it wakes
+  // the API itself behind our own waking screen.
   if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(request).catch(() => caches.match('/index.html'))
+      caches.match('/index.html').then((hit) => {
+        const network = fetch(request)
+          .then((res) => {
+            // Only replace the shell with a real app response, never with a
+            // gateway error or someone else's holding page.
+            const type = res.headers.get('content-type') || '';
+            if (res.ok && type.includes('text/html')) {
+              caches.open(VERSION).then((c) => c.put('/index.html', res.clone()));
+            }
+            return res;
+          })
+          .catch(() => hit);
+        return hit || network;
+      })
     );
     return;
   }

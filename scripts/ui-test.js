@@ -1,12 +1,21 @@
+/*
+ * Browser walk-through of the whole UI.
+ *   npm i --no-save playwright && npx playwright install chromium
+ *   npm start & node scripts/ui-test.js [baseUrl]
+ */
 const { chromium } = require('playwright');
-const BASE='http://localhost:3000';
+const BASE = process.argv[2] || 'http://localhost:3000';
 let pass=0, fail=0;
 const ok=(l)=>{pass++;console.log(`  \x1b[32m✓\x1b[0m ${l}`)};
 const bad=(l,d)=>{fail++;console.log(`  \x1b[31m✗\x1b[0m ${l} — ${d||''}`)};
 const check=(l,c,d)=>c?ok(l):bad(l,d);
 
 (async()=>{
-  const b=await chromium.launch();
+  // PLAYWRIGHT_CHROME lets you point at a chromium you already have, for
+  // environments where `npx playwright install` can't reach the download host.
+  const b = await chromium.launch(
+    process.env.PLAYWRIGHT_CHROME ? { executablePath: process.env.PLAYWRIGHT_CHROME } : {}
+  );
   const ctx=await b.newContext({viewport:{width:430,height:932}});
   const p=await ctx.newPage();
   const errs=[];

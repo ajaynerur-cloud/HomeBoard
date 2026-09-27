@@ -28,35 +28,114 @@ const TOKEN_KEY = 'hb.token';
 const getToken = () => localStorage.getItem(TOKEN_KEY);
 const setToken = (t) => (t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY));
 
+/**
+ * Where the API lives. Empty string on the web (same origin as the page).
+ * On Android the page is served from https://localhost inside the APK, so the
+ * build writes the live server URL into config.js and we use that instead.
+ */
+const API_BASE = (window.HOMEBOARD_API || '').replace(/\/+$/, '');
+
+/**
+ * Free hosting sleeps after 15 minutes idle and takes up to a minute to come
+ * back. While that happens the platform answers with its own holding page —
+ * an HTML body and a gateway status — rather than our JSON. We retry through
+ * it behind our own waking screen so nobody ever sees someone else's.
+ */
+const WAKE_DEADLINE_MS = 90000;
+const RETRY_STATUS = new Set([408, 502, 503, 504]);
+const BACKOFF = [800, 1500, 2500, 4000, 6000, 8000, 10000, 12000];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function api(path, { method = 'GET', body } = {}) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  let res;
-  try {
-    res = await fetch(`/api${path}`, {
-      method,
-      headers,
-      credentials: 'include',
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch {
-    throw new Error('Cannot reach HomeBoard. Check your connection.');
-  }
+  const started = Date.now();
+  let attempt = 0;
+  let lastReason = '';
 
-  let data = {};
-  try { data = await res.json(); } catch { /* empty body is fine */ }
+  for (;;) {
+    let res = null;
+    let transient = false;
 
-  if (res.status === 401 && state.user) {
-    setToken(null);
-    state.user = null;
-    showAuth();
-    throw new Error(data.error || 'Please sign in again.');
+    try {
+      res = await fetch(`${API_BASE}/api${path}`, {
+        method,
+        headers,
+        credentials: API_BASE ? 'omit' : 'include',
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch {
+      transient = true;
+      lastReason = 'the server did not answer';
+    }
+
+    if (res) {
+      // A gateway status, or an HTML body where JSON belongs, means the request
+      // never reached our code — it was the host's holding page. Safe to repeat,
+      // even for a POST.
+      const type = res.headers.get('content-type') || '';
+      const looksLikeJson = type.includes('application/json');
+      if (RETRY_STATUS.has(res.status) || (!looksLikeJson && !res.ok)) {
+        transient = true;
+        lastReason = `the server answered ${res.status}`;
+      } else if (!looksLikeJson && res.ok) {
+        // 200 with a non-JSON body: the request went somewhere that is not our
+        // API. Almost always a misconfigured API base in the mobile build.
+        throw new Error(
+          API_BASE
+            ? `The app is pointed at ${API_BASE}, which is not answering as HomeBoard. Rebuild it with the right server URL.`
+            : 'The server sent back something unexpected. Try again in a moment.'
+        );
+      }
+    }
+
+    if (transient) {
+      const elapsed = Date.now() - started;
+      if (elapsed < WAKE_DEADLINE_MS) {
+        showWaking();
+        await sleep(BACKOFF[Math.min(attempt, BACKOFF.length - 1)]);
+        attempt++;
+        continue;
+      }
+      hideWaking();
+      throw new Error(
+        `Could not reach HomeBoard — ${lastReason}. If it has been asleep a while, give it a moment and try again.`
+      );
+    }
+
+    hideWaking();
+
+    let data = {};
+    try { data = await res.json(); } catch { /* an empty body is fine */ }
+
+    if (res.status === 401 && state.user) {
+      setToken(null);
+      state.user = null;
+      showAuth();
+      throw new Error(data.error || 'Please sign in again.');
+    }
+    if (!res.ok) throw new Error(data.error || `Something went wrong (${res.status}).`);
+    return data;
   }
-  if (!res.ok) throw new Error(data.error || `Something went wrong (${res.status}).`);
-  return data;
+}
+
+/* The waking screen — ours, not the host's. */
+let wakeShownAt = 0;
+function showWaking() {
+  const el = $('#waking');
+  if (!el || el.classList.contains('show')) return;
+  wakeShownAt = Date.now();
+  el.classList.add('show');
+}
+function hideWaking() {
+  const el = $('#waking');
+  if (!el || !el.classList.contains('show')) return;
+  // Don't flash it away the instant it appears.
+  const held = Math.max(0, 450 - (Date.now() - wakeShownAt));
+  setTimeout(() => el.classList.remove('show'), held);
 }
 
 /* ───────────────────────── helpers ───────────────────────── */
@@ -183,6 +262,9 @@ $('#auth-form').addEventListener('submit', async (e) => {
 
   try {
     const data = await api(`/auth/${authMode}`, { method: 'POST', body: payload });
+    if (!data?.token || !data?.user?.id) {
+      throw new Error('The server replied but did not send an account back. Check that the app is pointed at your HomeBoard server.');
+    }
     setToken(data.token);
     state.user = data.user;
     await boot();
@@ -855,6 +937,7 @@ if ('serviceWorker' in navigator) {
 /* ───────────────────────── boot ───────────────────────── */
 
 async function boot() {
+  if (!state.user?.id) { showAuth(); return; }
   $('#auth-screen').classList.add('hidden');
   $('#app-screen').classList.remove('hidden');
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
@@ -866,12 +949,21 @@ async function boot() {
   if (!getToken()) { setAuthMode('signin'); showAuth(); return; }
   try {
     const { user } = await api('/auth/me');
+    if (!user?.id) throw new Error('no account returned');
     state.user = user;
     await boot();
-  } catch {
+  } catch (err) {
     setToken(null);
     setAuthMode('signin');
     showAuth();
+    // A dead API base is worth saying out loud rather than silently showing a
+    // sign-in box that can never succeed.
+    if (/pointed at|did not send an account/.test(err.message || '')) {
+      const box = $('#auth-alert');
+      box.textContent = err.message;
+      box.className = 'alert alert-error';
+      box.classList.remove('hidden');
+    }
   }
 })();
 
