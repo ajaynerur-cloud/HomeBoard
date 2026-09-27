@@ -25,28 +25,71 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+          cache: gradle
 
-      - uses: android-actions/setup-android@v3
-        with:
-          packages: 'platform-tools'
+      # No android-actions/setup-android here on purpose.
+      # Google removed the legacy "tools" SDK package in September 2026, and
+      # that action still asks for it by default, so it fails with
+      # "sdkmanager failed with exit code 1" on every run.
+      # The ubuntu-latest runner already ships the Android SDK, and the Android
+      # Gradle Plugin downloads whatever platform and build-tools it needs.
+      - name: Check the Android SDK and accept licences
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "No Android SDK on this runner at $ANDROID_HOME."
+            exit 1
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "Using SDK at $ANDROID_HOME"
+          # Already accepted on the hosted image; harmless belt-and-braces.
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
 
       - name: Point the app at the live server
         env:
           URL_INPUT: ${{ github.event.inputs.server_url }}
           URL_VAR: ${{ vars.HOMEBOARD_URL }}
         run: |
-          URL="${URL_INPUT:-$URL_VAR}"
-          if [ -z "$URL" ]; then
-            echo "No server URL. Pass it when running the workflow, or set a repo variable HOMEBOARD_URL."
+          export APP_URL="${URL_INPUT:-$URL_VAR}"
+          if [ -z "$APP_URL" ]; then
+            echo "No server URL. Pass it when you run the workflow, or set a repo variable HOMEBOARD_URL."
             exit 1
           fi
-          echo "Building against $URL"
-          node -e "
-            const fs=require('fs');
-            const c=JSON.parse(fs.readFileSync('capacitor.config.json','utf8'));
-            c.server.url=process.env.URL;
-            fs.writeFileSync('capacitor.config.json', JSON.stringify(c,null,2));
-          "
+          case "$APP_URL" in
+            https://*) ;;
+            *) echo "The URL must start with https:// — got '$APP_URL'"; exit 1 ;;
+          esac
+          APP_URL="${APP_URL%/}"
+
+          # The APK carries its own copy of the web app and loads it from
+          # https://localhost, so it never renders the host's "waking up" page.
+          # It only needs to know where the API lives.
+          node -e '
+            const fs = require("fs");
+            const url = process.env.APP_URL;
+            fs.writeFileSync("public/config.js",
+              "/* Written by the Android build. Do not edit. */\n" +
+              "window.HOMEBOARD_API = " + JSON.stringify(url) + ";\n");
+          '
+          echo "--- public/config.js ---"
+          cat public/config.js
+
+          # Fail early if that URL is not actually a HomeBoard server, rather
+          # than shipping an APK that can never sign anyone in.
+          echo "Checking $APP_URL/api/health (the server may need to wake up)…"
+          for i in $(seq 1 12); do
+            BODY="$(curl -fsS --max-time 20 "$APP_URL/api/health" || true)"
+            case "$BODY" in
+              *'"app":"HomeBoard"'*) echo "OK: $BODY"; exit 0 ;;
+            esac
+            echo "  attempt $i — not ready yet"
+            sleep 10
+          done
+          echo "No HomeBoard health response from $APP_URL/api/health after two minutes."
+          echo "Check the URL, and that the service is deployed."
+          exit 1
 
       - name: Install dependencies
         run: |
@@ -54,7 +97,7 @@ jobs:
           npm install --no-save @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets@3
 
       - name: Create the native project
-        run: npx cap add android
+        run: '[ -d android ] || npx cap add android'
 
       - name: Generate launcher icons and splash
         run: npx @capacitor/assets generate --android --assetPath resources

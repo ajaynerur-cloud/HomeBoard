@@ -1,0 +1,51 @@
+name: Keep HomeBoard awake
+
+# Free hosting spins the service down after ~15 minutes with no traffic, and the
+# next visitor then waits 30–50 seconds behind the host's own "waking up" page.
+# This pings the health endpoint often enough that it never goes to sleep.
+#
+# Before you enable it, read the trade-off in the README: a free Render web
+# service gets 750 instance-hours a month and a month is about 730 hours, so
+# this fits — but only for ONE service on the account. If you run a second free
+# service, you will run out partway through the month and both will stop.
+#
+# Set the repo variable HOMEBOARD_URL (Settings → Secrets and variables →
+# Actions → Variables) to your live URL, e.g. https://homeboard.onrender.com
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# Never let two pings overlap.
+concurrency:
+  group: keep-warm
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /api/health
+        env:
+          URL: ${{ vars.HOMEBOARD_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "No HOMEBOARD_URL repo variable set — nothing to ping."
+            echo "Add it under Settings → Secrets and variables → Actions → Variables."
+            exit 0
+          fi
+          URL="${URL%/}"
+          echo "Pinging $URL/api/health"
+          # A sleeping service can take ~50s to answer the first request.
+          if curl -fsS --max-time 90 "$URL/api/health"; then
+            echo ""
+            echo "awake"
+          else
+            echo ""
+            echo "No answer — the service may be deploying or suspended."
+            exit 1
+          fi
