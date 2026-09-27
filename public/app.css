@@ -439,3 +439,23 @@ main{flex:1;width:100%;max-width:760px;margin:0 auto;padding:16px 16px calc(96px
   display:grid;place-items:center;color:var(--ink-3);font-size:11px;font-weight:700;
 }
 .task.pri-high .task-chip{border-color:rgba(190,18,60,.45);color:var(--danger)}
+
+/* ---------- settings help ---------- */
+.hint{margin:8px 0 0;font-size:12px;color:var(--ink-3);line-height:1.6}
+.hint strong{color:var(--ink-2);font-weight:650}
+.help{
+  margin-top:16px;border:1px solid var(--line);border-radius:12px;
+  background:var(--surface-2);overflow:hidden;
+}
+.help summary{
+  padding:12px 14px;font-size:13px;font-weight:600;cursor:pointer;color:var(--ink-2);
+  list-style:none;
+}
+.help summary::-webkit-details-marker{display:none}
+.help summary::after{content:"＋";float:right;color:var(--ink-3);font-weight:400}
+.help[open] summary::after{content:"－"}
+.help summary:hover{background:var(--teal-50)}
+.help p,.help ol{margin:0 14px 11px;font-size:12.5px;color:var(--ink-3);line-height:1.65}
+.help ol{padding-left:18px}
+.help li{margin-bottom:6px}
+.help strong{color:var(--ink-2);font-weight:650}

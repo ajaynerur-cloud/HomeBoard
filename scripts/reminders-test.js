@@ -14,11 +14,14 @@ const check = (l, c, d) => c
   ? (pass++, console.log(`  \x1b[32m✓\x1b[0m ${l}`))
   : (fail++, console.log(`  \x1b[31m✗\x1b[0m ${l} — ${d || ''}`));
 
-/** A fake @capacitor/local-notifications, installed before the app boots. */
+/** A stand-in for @capacitor/local-notifications, installed before the app boots. */
 function fakePlugin({ permission = 'prompt', exact = 'granted' } = {}) {
   return `
-    window.__hb = { scheduled: [], cancelled: 0, asked: 0, openedExactSetting: 0,
-                    permission: ${JSON.stringify(permission)}, exact: ${JSON.stringify(exact)} };
+    window.__hb = {
+      scheduled: [], cancelledIds: [], asked: 0, openedExactSetting: 0,
+      channels: [], actionTypes: [], listeners: {},
+      permission: ${JSON.stringify(permission)}, exact: ${JSON.stringify(exact)},
+    };
     window.Capacitor = { Plugins: {
       LocalNotifications: {
         checkPermissions: async () => ({ display: window.__hb.permission }),
@@ -27,16 +30,34 @@ function fakePlugin({ permission = 'prompt', exact = 'granted' } = {}) {
           if (window.__hb.permission === 'prompt') window.__hb.permission = window.__hb.grantOnAsk ? 'granted' : 'denied';
           return { display: window.__hb.permission };
         },
-        schedule: async ({ notifications }) => { window.__hb.scheduled.push(...notifications); },
-        getPending: async () => ({ notifications: window.__hb.scheduled.map(n => ({ id: n.id })) }),
-        cancel: async () => { window.__hb.cancelled++; window.__hb.scheduled = []; },
+        createChannel: async (c) => { window.__hb.channels.push(c); },
+        registerActionTypes: async ({ types }) => { window.__hb.actionTypes.push(...types); },
+        schedule: async ({ notifications }) => {
+          // Mirror the real plugin: scheduling an existing id replaces it.
+          for (const n of notifications) {
+            const i = window.__hb.scheduled.findIndex(x => x.id === n.id);
+            if (i >= 0) window.__hb.scheduled[i] = n; else window.__hb.scheduled.push(n);
+          }
+        },
+        getPending: async () => ({ notifications: window.__hb.scheduled.map(n => ({ id: n.id, title: n.title })) }),
+        cancel: async ({ notifications }) => {
+          const ids = notifications.map(n => n.id);
+          window.__hb.cancelledIds.push(...ids);
+          window.__hb.scheduled = window.__hb.scheduled.filter(n => !ids.includes(n.id));
+        },
         checkExactNotificationSetting: async () => ({ exact_alarm: window.__hb.exact }),
         changeExactNotificationSetting: async () => { window.__hb.openedExactSetting++; },
+        addListener: (name, cb) => { (window.__hb.listeners[name] ||= []).push(cb); return { remove(){} }; },
       },
       App: { exitApp: () => { window.__hb.exited = true; }, addListener: () => {} },
     }};
+    // Lets the test pretend the user tapped a notification action.
+    window.__fire = (name, event) => (window.__hb.listeners[name] || []).forEach(cb => cb(event));
   `;
 }
+
+const BAND = 700000000;
+const bandOf = (id) => (id < BAND ? 'early' : id < BAND * 2 ? 'due' : 'snooze');
 
 async function signedInPage(browser, init, { grantOnAsk = true } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 430, height: 932 } });
@@ -90,26 +111,111 @@ async function signedInPage(browser, init, { grantOnAsk = true } = {}) {
     check('the toggle starts off', await p.isChecked('#reminders-toggle') === false);
     check('the copy promises background delivery on Android',
           (await p.textContent('#reminders-note')).includes('HomeBoard closed'));
+    check('the lead-time control is hidden until reminders are on',
+          await p.locator('#lead-field.hidden').count() === 1);
 
     await p.click('#reminders-toggle');
     await p.waitForTimeout(1500);
     const st = await p.evaluate(() => window.__hb);
     check('turning it on asks the system for permission', st.asked === 1, `asked ${st.asked}`);
     check('the toggle stays on once granted', await p.isChecked('#reminders-toggle'));
-    check('a reminder is scheduled for the task with a deadline', st.scheduled.length === 1,
-          JSON.stringify(st.scheduled.map(n => n.title)));
-    check('it carries the task title', st.scheduled[0]?.title === 'Bins out', st.scheduled[0]?.title);
-    check('it is scheduled at the due time, about three hours out', (() => {
-      const at = new Date(st.scheduled[0].schedule.at).getTime() - Date.now();
-      return at > 2.8 * 3600e3 && at < 3.1 * 3600e3;
-    })(), st.scheduled[0]?.schedule?.at);
-    check('the task with no deadline is not scheduled',
-          !st.scheduled.some(n => n.title === 'Someday thing'));
+    check('the lead-time control appears', await p.locator('#lead-field.hidden').count() === 0);
+    check('the background-apps help appears', await p.locator('#battery-help.hidden').count() === 0);
 
+    check('a high-importance channel is created for reminders',
+          st.channels.length === 1 && st.channels[0].importance === 5, JSON.stringify(st.channels));
+    check('a Snooze action is registered',
+          st.actionTypes[0]?.actions?.some((a) => a.id === 'SNOOZE' && /10 min/.test(a.title)),
+          JSON.stringify(st.actionTypes));
+
+    const bins = st.scheduled.filter((n) => n.title === 'Bins out');
+    check('two reminders are scheduled for the task — early and on time', bins.length === 2,
+          JSON.stringify(st.scheduled.map((n) => [n.title, n.body])));
+    check('one of each band', new Set(bins.map((n) => bandOf(n.id))).size === 2,
+          JSON.stringify(bins.map((n) => bandOf(n.id))));
+
+    const early = bins.find((n) => bandOf(n.id) === 'early');
+    const due = bins.find((n) => bandOf(n.id) === 'due');
+    check('the early one says how long is left', /Due in 10 minutes/.test(early.body), early.body);
+    check('the early one fires 10 minutes before the due time',
+          Math.round((new Date(due.schedule.at) - new Date(early.schedule.at)) / 60000) === 10,
+          `${early.schedule.at} -> ${due.schedule.at}`);
+    check('the due one lands about three hours out', (() => {
+      const at = new Date(due.schedule.at).getTime() - Date.now();
+      return at > 2.8 * 3600e3 && at < 3.1 * 3600e3;
+    })(), due.schedule.at);
+    check('both survive Doze', bins.every((n) => n.schedule.allowWhileIdle === true));
+    check('both carry the Snooze action', bins.every((n) => n.actionTypeId === 'HB_TASK_DUE'));
+    check('both carry the task id so a tap can open it',
+          bins.every((n) => typeof n.extra?.taskId === 'string' && n.extra.taskId.startsWith('tsk_')));
+    check('the task with no deadline is not scheduled',
+          !st.scheduled.some((n) => n.title === 'Someday thing'));
+
+    // Change the lead time
+    await p.selectOption('#lead-minutes', '30');
+    await p.waitForTimeout(1500);
+    const st30 = await p.evaluate(() => window.__hb);
+    const bins30 = st30.scheduled.filter((n) => n.title === 'Bins out');
+    const e30 = bins30.find((n) => bandOf(n.id) === 'early');
+    const d30 = bins30.find((n) => bandOf(n.id) === 'due');
+    check('changing the lead time reschedules the early warning',
+          Math.round((new Date(d30.schedule.at) - new Date(e30.schedule.at)) / 60000) === 30,
+          `${e30.schedule.at} -> ${d30.schedule.at}`);
+    check('and the worked example in the hint updates',
+          /21:00/.test(await p.textContent('#lead-hint')), await p.textContent('#lead-hint'));
+
+    // "Only at the due time"
+    await p.selectOption('#lead-minutes', '0');
+    await p.waitForTimeout(1500);
+    const st0 = await p.evaluate(() => window.__hb);
+    const bins0 = st0.scheduled.filter((n) => n.title === 'Bins out');
+    check('choosing "only at the due time" drops the early warning',
+          bins0.length === 1 && bandOf(bins0[0].id) === 'due', JSON.stringify(bins0.map((n) => bandOf(n.id))));
+
+    await p.selectOption('#lead-minutes', '10');
+    await p.waitForTimeout(1200);
+
+    // Snooze
+    await p.evaluate(() => {
+      const n = window.__hb.scheduled.find((x) => x.title === 'Bins out');
+      window.__fire('localNotificationActionPerformed', { actionId: 'SNOOZE', notification: n });
+    });
+    await p.waitForTimeout(1200);
+    const snoozed = await p.evaluate(() => window.__hb.scheduled.filter((n) => n.id >= 1400000000));
+    check('Snooze schedules a fresh reminder', snoozed.length === 1, JSON.stringify(snoozed));
+    check('ten minutes out', (() => {
+      const d = new Date(snoozed[0].schedule.at).getTime() - Date.now();
+      return d > 9.5 * 60000 && d < 10.5 * 60000;
+    })(), snoozed[0]?.schedule?.at);
+    check('and it says so on screen', /Snoozed for 10 minutes/.test(await p.textContent('#toast-text')),
+          await p.textContent('#toast-text'));
+
+    // The app refreshes every 20s — that must not wipe a snooze.
+    await p.keyboard.press('Escape');          // the Account sheet is still open
+    await p.waitForTimeout(400);
+    await p.click('#refresh-btn');
+    await p.waitForTimeout(2000);
+    const afterRefresh = await p.evaluate(() => window.__hb.scheduled.filter((n) => n.id >= 1400000000));
+    check('a refresh does not cancel the snooze', afterRefresh.length === 1,
+          JSON.stringify(afterRefresh));
+
+    // Tapping the notification body opens that task
+    await p.evaluate(() => {
+      const n = window.__hb.scheduled.find((x) => x.title === 'Bins out');
+      window.__fire('localNotificationActionPerformed', { actionId: 'tap', notification: n });
+    });
+    await p.waitForTimeout(900);
+    check('tapping a reminder opens that task',
+          (await p.textContent('#detail-body')).includes('Bins out')
+          || await p.locator('#sheet-detail.open').count() === 1);
+
+    await p.keyboard.press('Escape'); await p.waitForTimeout(400);
+    await p.click('#open-account'); await p.waitForTimeout(500);
     await p.click('#reminders-toggle');
-    await p.waitForTimeout(1000);
+    await p.waitForTimeout(1200);
     const st2 = await p.evaluate(() => window.__hb);
-    check('turning it off cancels what was scheduled', st2.scheduled.length === 0 && st2.cancelled > 0);
+    check('turning it off cancels everything, snoozes included', st2.scheduled.length === 0,
+          JSON.stringify(st2.scheduled));
     await p.context().close();
   }
 

@@ -1093,12 +1093,36 @@ const cap = () => window.Capacitor?.Plugins || null;
 const localNotifications = () => cap()?.LocalNotifications || null;
 const remindersOn = () => localStorage.getItem('hb.reminders') === '1';
 
-/** Stable 31-bit id per task, because the plugin wants integers. */
-function notifId(taskId) {
+/*
+ * Notification ids have to be 32-bit integers, and each task needs three that
+ * never collide: the early warning, the one at the due time, and any snooze.
+ * Three bands of 700 million keep them apart and inside the signed range.
+ */
+const BAND = 700000000;
+const BAND_EARLY = 0;
+const BAND_DUE = BAND;
+const BAND_SNOOZE = BAND * 2;
+
+function taskHash(taskId) {
   let h = 0;
   for (let i = 0; i < taskId.length; i++) h = (h * 31 + taskId.charCodeAt(i)) | 0;
-  return Math.abs(h) % 2147483647;
+  return Math.abs(h) % BAND;
 }
+const notifId = (taskId, band) => taskHash(taskId) + band;
+
+const CHANNEL_ID = 'homeboard-reminders';
+const ACTION_TYPE = 'HB_TASK_DUE';
+const SNOOZE_MINUTES = 10;
+
+const DEFAULT_LEAD_MINUTES = 10;
+const leadMinutes = () => {
+  // Careful: Number(null) is 0, not NaN, so an unset value would silently read
+  // as "only at the due time" and the early warning would never be scheduled.
+  const raw = localStorage.getItem('hb.leadMinutes');
+  if (raw === null || raw === '') return DEFAULT_LEAD_MINUTES;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : DEFAULT_LEAD_MINUTES;
+};
 
 const webTimers = new Map();
 
@@ -1108,12 +1132,69 @@ function myUpcoming() {
   );
 }
 
+/*
+ * A channel of its own, at max importance. The default channel is quiet enough
+ * that a reminder can sit unnoticed in the shade — this one behaves like an
+ * alarm: heads-up, sound, vibration.
+ */
+let channelReady = false;
+async function ensureChannel(ln) {
+  if (channelReady || !ln?.createChannel) return;
+  try {
+    await ln.createChannel({
+      id: CHANNEL_ID,
+      name: 'Task reminders',
+      description: 'When a task assigned to you is about to be due.',
+      importance: 5,
+      visibility: 1,
+      vibration: true,
+      lights: true,
+    });
+    channelReady = true;
+  } catch (err) {
+    console.warn('[HomeBoard] could not create the notification channel', err);
+  }
+}
+
+let actionsReady = false;
+async function ensureActions(ln) {
+  if (actionsReady || !ln?.registerActionTypes) return;
+  try {
+    await ln.registerActionTypes({
+      types: [{
+        id: ACTION_TYPE,
+        actions: [
+          { id: 'SNOOZE', title: `Snooze ${SNOOZE_MINUTES} min` },
+          { id: 'OPEN', title: 'Open', foreground: true },
+        ],
+      }],
+    });
+    actionsReady = true;
+  } catch (err) {
+    console.warn('[HomeBoard] could not register notification actions', err);
+  }
+}
+
+function notificationFor(task, band, at, body) {
+  return {
+    id: notifId(task.id, band),
+    title: task.title,
+    body,
+    largeBody: task.details ? task.details.slice(0, 300) : undefined,
+    schedule: { at, allowWhileIdle: true },
+    channelId: CHANNEL_ID,
+    actionTypeId: ACTION_TYPE,
+    smallIcon: 'ic_launcher',
+    extra: { taskId: task.id, projectId: task.projectId },
+  };
+}
+
 async function scheduleReminders() {
   if (!state.user) return;
   const ln = localNotifications();
 
   if (!remindersOn()) {
-    if (ln) { try { await clearNative(ln); } catch {} }
+    if (ln) { try { await clearNative(ln, { includeSnoozes: true }); } catch {} }
     for (const t of webTimers.values()) clearTimeout(t);
     webTimers.clear();
     return;
@@ -1121,15 +1202,32 @@ async function scheduleReminders() {
 
   if (ln) {
     try {
+      await ensureChannel(ln);
+      await ensureActions(ln);
       await clearNative(ln);
-      const notifications = myUpcoming().slice(0, 60).map((t) => ({
-        id: notifId(t.id),
-        title: t.title,
-        body: t.details ? t.details.slice(0, 120) : 'Due now on HomeBoard.',
-        schedule: { at: new Date(t.dueAt), allowWhileIdle: true },
-        smallIcon: 'ic_launcher',
-        extra: { taskId: t.id },
-      }));
+
+      const lead = leadMinutes();
+      const now = Date.now();
+      const notifications = [];
+
+      for (const t of myUpcoming().slice(0, 40)) {
+        const due = Date.parse(t.dueAt);
+
+        // The early warning — the point of the whole thing is to be told
+        // before the deadline, not as it passes.
+        if (lead > 0) {
+          const warnAt = due - lead * 60000;
+          if (warnAt > now + 5000) {
+            notifications.push(notificationFor(
+              t, BAND_EARLY, new Date(warnAt),
+              `Due in ${lead} minute${lead === 1 ? '' : 's'}${t.details ? ' — ' + t.details.slice(0, 60) : ''}`
+            ));
+          }
+        }
+
+        notifications.push(notificationFor(t, BAND_DUE, new Date(due), 'Due now.'));
+      }
+
       if (notifications.length) await ln.schedule({ notifications });
     } catch (err) {
       console.warn('[HomeBoard] could not schedule reminders', err);
@@ -1141,20 +1239,63 @@ async function scheduleReminders() {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   for (const t of webTimers.values()) clearTimeout(t);
   webTimers.clear();
+  const lead = leadMinutes();
   for (const t of myUpcoming()) {
-    const delay = Date.parse(t.dueAt) - Date.now();
-    if (delay > 6 * 60 * 60 * 1000) continue;   // setTimeout that far out is unreliable
-    webTimers.set(t.id, setTimeout(() => {
-      try {
-        new Notification(t.title, { body: 'Due now on HomeBoard.', icon: '/icons/icon-192.png', tag: t.id });
-      } catch {}
-    }, Math.max(0, delay)));
+    const due = Date.parse(t.dueAt);
+    const points = lead > 0 ? [[due - lead * 60000, `Due in ${lead} min`], [due, 'Due now.']] : [[due, 'Due now.']];
+    points.forEach(([at, body], i) => {
+      const delay = at - Date.now();
+      if (delay < 0 || delay > 6 * 60 * 60 * 1000) return;
+      webTimers.set(`${t.id}:${i}`, setTimeout(() => {
+        try { new Notification(t.title, { body, icon: '/icons/icon-192.png', tag: `${t.id}:${i}` }); } catch {}
+      }, delay));
+    });
   }
 }
 
-async function clearNative(ln) {
+/* Snoozing, and opening the task a notification came from. */
+async function handleNotificationAction(ln, event) {
+  const taskId = event?.notification?.extra?.taskId;
+  const title = event?.notification?.title || 'Task';
+
+  if (event?.actionId === 'SNOOZE') {
+    try {
+      await ensureChannel(ln);
+      await ensureActions(ln);
+      const at = new Date(Date.now() + SNOOZE_MINUTES * 60000);
+      await ln.schedule({
+        notifications: [{
+          id: (taskId ? taskHash(taskId) : Math.floor(Math.random() * BAND)) + BAND_SNOOZE,
+          title,
+          body: `Snoozed — still to do.`,
+          schedule: { at, allowWhileIdle: true },
+          channelId: CHANNEL_ID,
+          actionTypeId: ACTION_TYPE,
+          smallIcon: 'ic_launcher',
+          extra: { taskId },
+        }],
+      });
+      toast(`Snoozed for ${SNOOZE_MINUTES} minutes.`);
+    } catch (err) {
+      console.warn('[HomeBoard] snooze failed', err);
+    }
+    return;
+  }
+
+  if (taskId && state.tasks.some((t) => t.id === taskId)) openDetail(taskId);
+}
+
+/**
+ * Clear the scheduled warnings, but leave snoozes alone — the app refreshes
+ * every twenty seconds, and cancelling everything would silently throw away a
+ * snooze the moment it was set.
+ */
+async function clearNative(ln, { includeSnoozes = false } = {}) {
   const pending = await ln.getPending();
-  if (pending?.notifications?.length) await ln.cancel({ notifications: pending.notifications });
+  const list = (pending?.notifications || []).filter(
+    (n) => includeSnoozes || n.id < BAND_SNOOZE
+  );
+  if (list.length) await ln.cancel({ notifications: list });
 }
 
 async function setReminders(on) {
@@ -1165,6 +1306,8 @@ async function setReminders(on) {
     await scheduleReminders();
     toggle.checked = false;
     updateRemindersNote();
+    $('#lead-field')?.classList.add('hidden');
+    $('#battery-help')?.classList.add('hidden');
     return;
   }
 
@@ -1205,6 +1348,9 @@ async function setReminders(on) {
   toggle.checked = true;
   await scheduleReminders();
   updateRemindersNote();
+  updateLeadHint();
+  $('#lead-field')?.classList.remove('hidden');
+  if (ln) $('#battery-help')?.classList.remove('hidden');
 
   // Granted, but Android 12+ still downgrades the alarm unless "Alarms &
   // reminders" is allowed. Better to say so than to quietly be ten minutes late.
@@ -1246,6 +1392,9 @@ async function syncRemindersToggle() {
     await scheduleReminders();
   }
   toggle.checked = remindersOn() && osAllows;
+  updateLeadHint();
+  $('#lead-field')?.classList.toggle('hidden', !toggle.checked);
+  $('#battery-help')?.classList.toggle('hidden', !(toggle.checked && localNotifications()));
   updateRemindersNote();
 }
 
@@ -1258,6 +1407,34 @@ function updateRemindersNote() {
 }
 
 $('#reminders-toggle').addEventListener('change', (e) => setReminders(e.target.checked));
+
+$('#lead-minutes').addEventListener('change', async (e) => {
+  localStorage.setItem('hb.leadMinutes', e.target.value);
+  updateLeadHint();
+  await scheduleReminders();
+  const m = Number(e.target.value);
+  toast(m ? `You'll be warned ${m} minutes before.` : 'Only reminding you at the due time.');
+});
+
+function updateLeadHint() {
+  const sel = $('#lead-minutes');
+  if (sel) sel.value = String(leadMinutes());
+  const hint = $('#lead-hint');
+  if (!hint) return;
+  const m = leadMinutes();
+  if (!m) {
+    hint.innerHTML = `You'll only hear about it at the due time. Every reminder carries a <strong>Snooze ${SNOOZE_MINUTES} min</strong> button.`;
+    return;
+  }
+  // Worked example beats an abstract description of the setting.
+  const example = new Date();
+  example.setHours(21, 30, 0, 0);
+  const warn = new Date(example.getTime() - m * 60000);
+  const hhmm = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  hint.innerHTML =
+    `A task due at ${hhmm(example)} warns you at <strong>${hhmm(warn)}</strong>, then again at ${hhmm(example)}. ` +
+    `Both carry a <strong>Snooze ${SNOOZE_MINUTES} min</strong> button.`;
+}
 
 /* ───────────────────────── QR invites ───────────────────────── */
 
@@ -1339,6 +1516,13 @@ $('#delete-account').addEventListener('click', async () => {
     alert(err.message);
   }
 });
+
+/* React to a notification being tapped or snoozed. */
+(function notificationListeners() {
+  const ln = localNotifications();
+  if (!ln?.addListener) return;
+  ln.addListener('localNotificationActionPerformed', (event) => handleNotificationAction(ln, event));
+})();
 
 /* Closing the app, and making the Android back button behave. */
 (function androidShell() {

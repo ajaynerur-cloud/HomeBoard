@@ -284,6 +284,35 @@
           <em id="reminders-note">A notification when time runs out on anything assigned to you.</em>
         </span>
       </label>
+
+      <label class="field" id="lead-field" style="margin-top:16px">
+        <span>Warn me before it's due</span>
+        <select class="select" id="lead-minutes">
+          <option value="5">5 minutes before</option>
+          <option value="10" selected>10 minutes before</option>
+          <option value="15">15 minutes before</option>
+          <option value="30">30 minutes before</option>
+          <option value="60">1 hour before</option>
+          <option value="0">Only at the due time</option>
+        </select>
+        <p class="hint" id="lead-hint">A task due at 21:30 warns you at 21:20, then again at 21:30. Each one has a
+          <strong>Snooze 10 min</strong> button.</p>
+      </label>
+
+      <details class="help" id="battery-help">
+        <summary>Reminders not arriving when the app is closed?</summary>
+        <p>Reminders are alarms held by Android itself, so they fire whether or not HomeBoard is
+        running — including after you swipe it away. Some phones (Realme, Oppo, Xiaomi, Samsung,
+        OnePlus) put apps to sleep aggressively and will hold them back anyway.</p>
+        <p>On those, allow HomeBoard to run in the background:</p>
+        <ol>
+          <li>Settings → Apps → HomeBoard → <strong>Battery</strong> → allow background activity,
+              or set it to <strong>Unrestricted</strong> / <strong>Don't optimise</strong>.</li>
+          <li>On Realme and Oppo, also turn on <strong>Auto-launch</strong> (sometimes under
+              App management → Auto startup).</li>
+          <li>Settings → Apps → HomeBoard → <strong>Alarms &amp; reminders</strong> → allow.</li>
+        </ol>
+      </details>
     </div>
 
     <button class="btn btn-block" id="signout-btn">Sign out</button>
