@@ -27,6 +27,15 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
 
   console.log('\nUI flow\n');
   await p.goto(BASE);
+
+  // Show / hide password
+  await p.waitForSelector('#peek-password');
+  check('password starts hidden', await p.getAttribute('#auth-form [name=password]', 'type') === 'password');
+  await p.click('#peek-password');
+  check('tapping the eye reveals it', await p.getAttribute('#auth-form [name=password]', 'type') === 'text');
+  await p.click('#peek-password');
+  check('tapping again hides it', await p.getAttribute('#auth-form [name=password]', 'type') === 'password');
+
   await p.click('#tab-signup');
   await p.fill('[name=name]','Test Person');
   await p.fill('#auth-form [name=email]',email);
@@ -61,8 +70,12 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   check('checklist count shows', meta.includes('0/1'), meta);
   check('priority stripe applied', await p.locator('.task.pri-high').count() === 1);
 
-  await p.click('.task-body');
+  check('no one-tap complete button on the card', await p.locator('.task .tick').count() === 0);
+  await p.click('.task-open');
   await p.waitForTimeout(600);
+  check('tapping the card opens it instead of completing it',
+        await p.locator('#sheet-detail.open').count() === 1);
+  check('the task is still on the board', await p.locator('.task').count() === 1);
   const detail = await p.textContent('#detail-body');
   check('detail sheet shows the details text', detail.includes('4412'));
   check('detail sheet shows the step', detail.includes('Bin to the kerb'));
@@ -78,8 +91,21 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
         await p.textContent('#detail-body').then(t=>t.slice(0,80)));
 
   await p.click('#detail-complete');
-  await p.waitForTimeout(1500);
+  await p.waitForTimeout(1600);
   check('task gone from the board', await p.locator('.task').count() === 0);
+  check('an Undo is offered', await p.locator('#toast-action:not(.hidden)').count() === 1);
+
+  await p.click('#toast-action');
+  await p.waitForTimeout(1600);
+  check('Undo puts the task back', await p.locator('.task-title', { hasText: 'Take the bins out' }).count() === 1);
+  await p.click('.task-open');
+  await p.waitForTimeout(600);
+  check('and its details survived the round trip',
+        (await p.textContent('#detail-body')).includes('4412'));
+
+  await p.click('#detail-complete');
+  await p.waitForTimeout(1600);
+  check('completing again works', await p.locator('.task').count() === 0);
 
   await p.click('.tabs button[data-view=done]');
   await p.waitForTimeout(500);
@@ -93,6 +119,9 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   await p.waitForTimeout(500);
   const code = await p.textContent('#invite-code');
   check('join code visible', /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(code.trim()), code);
+  check('a QR code is drawn for the invite', await p.locator('#invite-qr svg').count() === 1);
+  const qrModules = await p.locator('#invite-qr svg path').getAttribute('d');
+  check('the QR has real content', (qrModules || '').length > 400, `path length ${(qrModules || '').length}`);
 
   const p2 = await (await b.newContext({viewport:{width:430,height:932}})).newPage();
   p2.on('pageerror',e=>errs.push('p2 pageerror: '+e.message));
@@ -130,10 +159,73 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   await p.waitForTimeout(1600);
   check('lands on the other person\'s "For me"', await p.locator('.task-title',{hasText:'Call the plumber'}).count()>0);
 
-  // tick from the card
-  await p.click('.tick');
-  await p.waitForTimeout(1600);
-  check('one-tap complete from the card works', await p.locator('.task').count()===0);
+  // Live sync: person 2 adds a task, person 1 sees it without touching anything.
+  await p2.click('#fab');
+  await p2.waitForTimeout(400);
+  await p2.fill('#task-form [name=title]', 'Defrost the freezer');
+  const other2 = p2.locator('#assignee-picker .person').filter({ hasNotText: 'Me' }).first();
+  await other2.click();
+  await p2.click('#task-save');
+  await p2.waitForTimeout(1200);
+
+  console.log('  (waiting for the poll to bring it across…)');
+  await p.waitForSelector('.task-title:has-text("Defrost the freezer")', { timeout: 30000 });
+  check('a task added by someone else appears without a reload', true);
+
+  // Explicit refresh button
+  await p.click('#refresh-btn');
+  await p.waitForTimeout(1200);
+  check('the refresh button works', await p.locator('.task').count() >= 1);
+
+  // Hand the board over. Person 1 created the board, so person 1 owns it.
+  await p.click('#open-members');
+  await p.waitForTimeout(700);
+  const canHand = await p.locator('#member-list [data-makeowner]').count();
+  check('the owner is offered "Make owner" for other members', canHand >= 1, `found ${canHand}`);
+  check('a member is not offered it', await p2.locator('#member-list [data-makeowner]').count() === 0);
+
+  p.once('dialog', (d) => d.accept());
+  await p.click('#member-list [data-makeowner] >> nth=0');
+  await p.waitForTimeout(2000);
+  check('after handing over, the old owner loses the Make owner action',
+        await p.locator('#member-list [data-makeowner]').count() === 0);
+  check('and the board settings are hidden from them',
+        await p.locator('#danger-block.hidden').count() === 1);
+
+  // Deleting an account is refused while it still owns a shared board.
+  await p2.click('.close-x >> nth=0').catch(() => {});
+  await p2.keyboard.press('Escape');
+  await p2.waitForTimeout(300);
+  await p2.click('#open-account');
+  await p2.waitForTimeout(600);
+  let alerted = '';
+  p2.on('dialog', async (d) => {
+    if (d.type() === 'confirm') { await d.accept(); }
+    else { alerted = d.message(); await d.accept(); }
+  });
+  await p2.click('#delete-account');
+  await p2.waitForTimeout(2500);
+  check('deleting an account that owns a shared board is refused, with a reason',
+        /still own/i.test(alerted), alerted || '(no dialog)');
+
+  // Scanning the QR opens a ?join= link. New person: sign up, land on the board.
+  await p.keyboard.press('Escape');
+  const p3 = await (await b.newContext({ viewport: { width: 430, height: 932 } })).newPage();
+  p3.on('pageerror', (e) => errs.push('p3 pageerror: ' + e.message));
+  await p3.goto(`${BASE}/?join=${code.trim()}`);
+  await p3.waitForTimeout(800);
+  check('an invite link opens straight on Create account',
+        await p3.getAttribute('#tab-signup', 'aria-selected') === 'true');
+  check('the URL is cleaned up', !p3.url().includes('join='), p3.url());
+  await p3.fill('[name=name]', 'Scanned Person');
+  await p3.fill('#auth-form [name=email]', `scan.${s}@demo.com`);
+  await p3.fill('#auth-form [name=password]', 'homeboard123');
+  await p3.click('#auth-submit');
+  await p3.waitForSelector('#app-screen:not(.hidden)', { timeout: 15000 });
+  await p3.waitForTimeout(2500);
+  check('and they join the board automatically after signing up',
+        (await p3.textContent('#board-name')).includes('Flat 3B'),
+        await p3.textContent('#board-name'));
 
   console.log(`\n  js errors: ${errs.length? JSON.stringify(errs,null,2):'none'}`);
   console.log(`\n${fail===0?'\x1b[32m':'\x1b[31m'}${pass} passed, ${fail} failed\x1b[0m\n`);

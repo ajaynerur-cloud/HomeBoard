@@ -214,6 +214,9 @@ router.post('/:id/complete', async (req, res, next) => {
       ok: true,
       purged: true,
       history: { ...entry, completedBy: publicUser(byId.get(entry.completedById)) },
+      // Handed back so the app can offer an Undo. It is not stored anywhere
+      // once this response is sent — if the app doesn't use it, it's gone.
+      undo: existing,
     });
   } catch (err) {
     next(err);
@@ -258,6 +261,41 @@ router.get('/history/list', async (req, res, next) => {
         assignedTo: publicUser(byId.get(h.assignedToId)),
       })),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Undo a completion: put the task back exactly as it was and remove the
+ * history line. Only works while the app still holds the task it was given
+ * back — nothing is kept server-side after the completion response.
+ */
+router.post('/restore', async (req, res, next) => {
+  try {
+    const task = req.body?.task;
+    const historyId = String(req.body?.historyId || '');
+    if (!task?.id || !task?.projectId) return res.status(400).json({ error: 'Nothing to restore.' });
+
+    const { error } = await loadProject(task.projectId, req.user.id);
+    if (error) return res.status(error.code).json({ error: error.message });
+
+    const out = await store.update('tasks', (rows) => {
+      if (rows.some((t) => t.id === task.id)) return { code: 409, error: 'That task is already on the board.' };
+      rows.push({ ...task, updatedAt: new Date().toISOString() });
+      return { ok: true };
+    }, `HomeBoard: restored "${String(task.title || '').slice(0, 60)}"`);
+    if (out.error) return res.status(out.code).json({ error: out.error });
+
+    if (historyId) {
+      await store.update('history', (rows) => {
+        const i = rows.findIndex((h) => h.id === historyId && h.projectId === task.projectId);
+        if (i !== -1) rows.splice(i, 1);
+      }, 'HomeBoard: history line removed by undo');
+    }
+
+    const [decorated] = await decorate([task]);
+    res.json({ task: decorated });
   } catch (err) {
     next(err);
   }

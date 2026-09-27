@@ -375,3 +375,67 @@ main{flex:1;width:100%;max-width:760px;margin:0 auto;padding:16px 16px calc(96px
   0%{transform:translateX(-100%)}
   100%{transform:translateX(250%)}
 }
+
+/* ---------- password show/hide ---------- */
+.with-toggle{position:relative}
+.with-toggle .input{padding-right:46px}
+.peek{
+  position:absolute;right:5px;top:50%;transform:translateY(-50%);
+  width:36px;height:36px;border-radius:9px;display:grid;place-items:center;color:var(--ink-3);
+}
+.peek:hover{background:var(--teal-50);color:var(--ink-2)}
+.peek[aria-pressed="true"]{color:var(--teal-700)}
+
+/* ---------- refresh ---------- */
+#refresh-icon{transition:transform .2s ease}
+#refresh-btn.spinning #refresh-icon{animation:spin .8s linear infinite}
+.pull{
+  height:0;overflow:hidden;display:grid;place-items:center;color:var(--ink-3);
+  font-size:12.5px;font-weight:600;transition:height .18s ease;
+}
+.pull.armed{color:var(--teal-700)}
+
+/* ---------- QR ---------- */
+.qr-wrap{margin-top:13px;display:flex;flex-direction:column;align-items:center;gap:9px}
+.qr{
+  padding:11px;background:#fff;border:1px solid var(--line);border-radius:14px;
+  line-height:0;box-shadow:var(--shadow-sm);
+}
+.qr svg{display:block;border-radius:6px}
+.qr-note{margin:0;font-size:12px;color:var(--ink-3);text-align:center;max-width:34ch;line-height:1.55}
+
+/* ---------- switch ---------- */
+.switch{display:flex;align-items:flex-start;gap:12px;cursor:pointer}
+.switch input{
+  appearance:none;width:44px;height:26px;border-radius:99px;background:var(--line);
+  position:relative;flex:none;transition:background .18s ease;margin-top:1px;cursor:pointer;
+}
+.switch input::after{
+  content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
+  background:#fff;transition:transform .18s ease;box-shadow:0 1px 3px rgba(0,0,0,.25);
+}
+.switch input:checked{background:var(--teal-700)}
+.switch input:checked::after{transform:translateX(18px)}
+.switch span{display:block;min-width:0}
+.switch strong{display:block;font-size:14px;font-weight:600}
+.switch em{display:block;font-style:normal;font-size:12.5px;color:var(--ink-3);margin-top:3px;line-height:1.55}
+
+/* ---------- toast with an action ---------- */
+#toast{display:flex;align-items:center;gap:14px}
+/* The toast itself stays click-through so it never blocks the list underneath,
+   but its action button has to be tappable or Undo is decorative. */
+#toast.show #toast-action{pointer-events:auto}
+#toast-action{
+  color:var(--teal-100);font-weight:700;font-size:13px;padding:3px 2px;
+  border-bottom:1.5px solid currentColor;flex:none;
+}
+#toast-action:hover{color:#fff}
+
+/* card is one big target now that the tick is gone */
+.task{cursor:pointer}
+.task-open{display:flex;align-items:flex-start;gap:12px;width:100%;text-align:left}
+.task-chip{
+  width:23px;height:23px;border-radius:50%;border:2px solid var(--line);flex:none;margin-top:1px;
+  display:grid;place-items:center;color:var(--ink-3);font-size:11px;font-weight:700;
+}
+.task.pri-high .task-chip{border-color:rgba(190,18,60,.45);color:var(--danger)}

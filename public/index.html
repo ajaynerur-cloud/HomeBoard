@@ -47,7 +47,13 @@
       </label>
       <label class="field">
         <span>Password</span>
-        <input class="input" name="password" type="password" autocomplete="current-password" placeholder="At least 8 characters" required>
+        <div class="with-toggle">
+          <input class="input" name="password" type="password" autocomplete="current-password" placeholder="At least 8 characters" required>
+          <button type="button" class="peek" id="peek-password" aria-label="Show password" aria-pressed="false">
+            <svg class="eye-on" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            <svg class="eye-off hidden" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.9 17.9A10.1 10.1 0 0 1 12 20c-7 0-11-8-11-8a18.5 18.5 0 0 1 5.1-5.9m3.6-1.7A10.1 10.1 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.2 3.2M1 1l22 22M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
+          </button>
+        </div>
       </label>
       <button class="btn btn-primary btn-block" type="submit" id="auth-submit">Sign in</button>
     </form>
@@ -65,6 +71,9 @@
     <button class="board-switch" id="board-switch">
       <span class="nm" id="board-name">Loading…</span>
       <svg width="12" height="8" viewBox="0 0 12 8" fill="none" aria-hidden="true"><path d="M1 1l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <button class="btn btn-ghost btn-sm" id="refresh-btn" title="Check for changes">
+      <svg id="refresh-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6M3 22v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L21 8M21 15a9 9 0 0 1-14.9 3.4L3 16"/></svg>
     </button>
     <button class="btn btn-ghost btn-sm" id="open-members" title="People on this board">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
@@ -223,9 +232,18 @@
       <p style="font-size:12.5px;color:var(--ink-3);margin:0 0 9px">Or share the join code — anyone with it can join this board.</p>
       <div class="code-box">
         <code id="invite-code">————</code>
-        <button class="btn btn-sm" id="copy-code">Copy</button>
+        <button class="btn btn-sm" id="copy-code">Share</button>
       </div>
-      <button class="btn btn-ghost btn-sm" id="rotate-code" style="margin-top:9px">Reset code</button>
+
+      <div class="qr-wrap">
+        <div id="invite-qr" class="qr"></div>
+        <p class="qr-note">Point a phone camera at this. It opens HomeBoard with the code already filled in.</p>
+      </div>
+
+      <div style="display:flex;gap:9px;margin-top:11px;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" id="rotate-code">Reset code</button>
+        <button class="btn btn-ghost btn-sm" id="save-qr">Save QR image</button>
+      </div>
     </div>
     <div class="detail-block" id="danger-block">
       <h4>Board settings</h4>
@@ -257,14 +275,35 @@
         <button type="button" data-v="dark" aria-pressed="false">Dark</button>
       </div>
     </div>
+    <div class="detail-block">
+      <h4>Reminders</h4>
+      <label class="switch">
+        <input type="checkbox" id="reminders-toggle">
+        <span>
+          <strong>Remind me when a task is due</strong>
+          <em id="reminders-note">A notification when time runs out on anything assigned to you.</em>
+        </span>
+      </label>
+    </div>
+
     <button class="btn btn-block" id="signout-btn">Sign out</button>
+    <button class="btn btn-block hidden" id="exit-btn" style="margin-top:9px">Close HomeBoard</button>
+
+    <div class="detail-block" style="margin-top:26px">
+      <h4>Danger zone</h4>
+      <button class="btn btn-danger btn-block" id="delete-account">Delete my account</button>
+      <p style="font-size:12px;color:var(--ink-3);margin:9px 0 0;line-height:1.6">
+        Deletes your account, the boards only you are on, and every task on them. Boards you share with
+        other people are not touched — hand those over first.
+      </p>
+    </div>
     <p style="font-size:11.5px;color:var(--ink-3);text-align:center;margin:18px 0 0;line-height:1.6">
       HomeBoard · when a task is marked done its details, steps and notes are deleted for good — only the name is kept.
     </p>
   </div>
 </section>
 
-<div id="toast" role="status" aria-live="polite"></div>
+<div id="toast" role="status" aria-live="polite"><span id="toast-text"></span><button id="toast-action" class="hidden"></button></div>
 <!-- ============ WAKING ============ -->
 <div id="waking" aria-live="polite">
   <img src="/icons/icon-192.png" alt="" width="72" height="72">
@@ -274,6 +313,7 @@
 </div>
 
 <script src="/config.js"></script>
+<script src="/qr.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

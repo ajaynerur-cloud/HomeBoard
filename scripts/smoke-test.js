@@ -132,11 +132,62 @@ async function call(path, { method = 'GET', body, token } = {}) {
   const badJoin = await call('/projects/join', { method: 'POST', token: carol.data.token, body: { code: 'ZZZZ-9999' } });
   check('a bad code is refused', badJoin.status === 404, `got ${badJoin.status}`);
 
+  console.log('\nUndo a completion');
+  const t2 = await call('/tasks', {
+    method: 'POST', token: A,
+    body: { projectId: P.id, title: 'Defrost the freezer', assigneeId: aliceId, details: 'Towels are under the sink.' },
+  });
+  const done2 = await call(`/tasks/${t2.data.task.id}/complete`, { method: 'POST', token: A });
+  check('completion hands the task back for undo', Boolean(done2.data.undo?.id), JSON.stringify(done2.data).slice(0, 120));
+  const restored = await call('/tasks/restore', {
+    method: 'POST', token: A,
+    body: { task: done2.data.undo, historyId: done2.data.history.id },
+  });
+  check('undo puts the task back', restored.status === 200, JSON.stringify(restored.data).slice(0, 120));
+  const afterUndo = await call('/tasks', { token: A });
+  const back = afterUndo.data.tasks.find((t) => t.id === t2.data.task.id);
+  check('restored task keeps its details', back?.details.includes('under the sink'));
+  const histAfter = await call('/tasks/history/list', { token: A });
+  check('undo removes the history line', !histAfter.data.history.some((h) => h.id === done2.data.history.id));
+  const doubleUndo = await call('/tasks/restore', { method: 'POST', token: A, body: { task: done2.data.undo } });
+  check('undo twice is refused', doubleUndo.status === 409, `got ${doubleUndo.status}`);
+  await call(`/tasks/${t2.data.task.id}`, { method: 'DELETE', token: A });
+
+  console.log('\nHanding the board over');
+  const notOwner = await call(`/projects/${P.id}/transfer-owner`, { method: 'POST', token: B, body: { userId: bobId } });
+  check('a member cannot take ownership', notOwner.status === 403, `got ${notOwner.status}`);
+  const toStranger = await call(`/projects/${P.id}/transfer-owner`, { method: 'POST', token: A, body: { userId: outsider.data.user.id } });
+  check('cannot hand it to someone off the board', toStranger.status === 400, `got ${toStranger.status}`);
+  const handed = await call(`/projects/${P.id}/transfer-owner`, { method: 'POST', token: A, body: { userId: bobId } });
+  check('owner hands the board to Bob', handed.status === 200, JSON.stringify(handed.data).slice(0, 120));
+  check('Bob is recorded as owner', handed.data.project.ownerId === bobId);
+  check('Alice is demoted to member',
+        handed.data.project.members.find((m) => m.userId === aliceId)?.role === 'member');
+  const aliceTries = await call(`/projects/${P.id}`, { method: 'PATCH', token: A, body: { name: 'nope' } });
+  check('the old owner loses owner powers', aliceTries.status === 403, `got ${aliceTries.status}`);
+
+  console.log('\nDeleting an account');
+  const blocked = await call('/auth/me', { method: 'DELETE', token: B });
+  check('cannot delete while owning a shared board', blocked.status === 409, `got ${blocked.status}`);
+  check('the refusal names the board', /Flat 3B/.test(blocked.data.error || ''), blocked.data.error);
+
+  const solo = await call('/auth/signup', {
+    method: 'POST', body: { name: 'Solo', email: `solo.${stamp}@example.com`, password: 'household123' },
+  });
+  const soloBoard = await call('/projects', { method: 'POST', token: solo.data.token, body: { name: 'Just me' } });
+  await call('/tasks', { method: 'POST', token: solo.data.token, body: { projectId: soloBoard.data.project.id, title: 'Water the plants' } });
+  const gone = await call('/auth/me', { method: 'DELETE', token: solo.data.token });
+  check('an account with only solo boards deletes', gone.status === 200 && gone.data.boardsDeleted === 1, JSON.stringify(gone.data));
+  const ghost = await call('/auth/me', { token: solo.data.token });
+  check('the deleted account can no longer sign in', ghost.status === 401, `got ${ghost.status}`);
+  const reSignin = await call('/auth/signin', { method: 'POST', body: { email: `solo.${stamp}@example.com`, password: 'household123' } });
+  check('and its password no longer works', reSignin.status === 401, `got ${reSignin.status}`);
+
   console.log('\nCleanup');
-  const del = await call(`/projects/${P.id}`, { method: 'DELETE', token: B });
+  const del = await call(`/projects/${P.id}`, { method: 'DELETE', token: A });
   check('a non-owner cannot delete the board', del.status === 403, `got ${del.status}`);
-  const del2 = await call(`/projects/${P.id}`, { method: 'DELETE', token: A });
-  check('the owner can delete the board', del2.status === 200);
+  const del2 = await call(`/projects/${P.id}`, { method: 'DELETE', token: B });
+  check('the new owner can delete the board', del2.status === 200);
 
   console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m\n`);
   process.exit(failed === 0 ? 0 : 1);

@@ -210,4 +210,29 @@ router.delete('/:id', async (req, res, next) => {
   }
 });
 
+/** Hand the board over to somebody else. The old owner stays on as a member. */
+router.post('/:id/transfer-owner', async (req, res, next) => {
+  try {
+    const userId = String(req.body?.userId || '');
+    const out = await store.update('projects', (rows) => {
+      const p = rows.find((x) => x.id === req.params.id);
+      if (!p) return { code: 404, error: 'Board not found.' };
+      if (!isOwner(p, req.user.id)) return { code: 403, error: 'Only the current owner can hand the board over.' };
+      const target = p.members.find((m) => m.userId === userId);
+      if (!target) return { code: 400, error: 'That person is not on this board.' };
+      if (userId === req.user.id) return { code: 400, error: 'You already own this board.' };
+      for (const m of p.members) m.role = m.userId === userId ? 'owner' : 'member';
+      p.ownerId = userId;
+      return { project: p };
+    }, 'HomeBoard: ownership transferred');
+
+    if (out.error) return res.status(out.code).json({ error: out.error });
+    const [decorated] = await decorate([out.project]);
+    const newOwner = decorated.members.find((m) => m.userId === userId);
+    res.json({ project: decorated, message: `${newOwner?.user?.name || 'They'} owns this board now.` });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

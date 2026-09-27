@@ -192,12 +192,27 @@ function toLocalInput(iso) {
 }
 
 let toastTimer;
-function toast(message) {
+/** `action` is optional: { label, run } puts a button in the toast. */
+function toast(message, action = null, ms = null) {
   const el = $('#toast');
-  el.textContent = message;
+  const btn = $('#toast-action');
+  $('#toast-text').textContent = message;
+
+  btn.classList.toggle('hidden', !action);
+  if (action) {
+    btn.textContent = action.label;
+    btn.onclick = () => {
+      el.classList.remove('show');
+      clearTimeout(toastTimer);
+      action.run();
+    };
+  } else {
+    btn.onclick = null;
+  }
+
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+  toastTimer = setTimeout(() => el.classList.remove('show'), ms || (action ? 9000 : 2800));
 }
 
 /* ───────────────────────── sheets ───────────────────────── */
@@ -240,6 +255,20 @@ function setAuthMode(mode) {
       : 'New here? Create an account — it takes a few seconds.';
   $('#auth-alert').classList.add('hidden');
 }
+
+/* Show / hide the password. Worth having: a mistyped password on a phone
+   keyboard is the single most common reason a sign-in fails. */
+$('#peek-password').addEventListener('click', () => {
+  const btn = $('#peek-password');
+  const input = $('#auth-form [name=password]');
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+  btn.setAttribute('aria-pressed', String(!showing));
+  btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+  $('.eye-on', btn).classList.toggle('hidden', !showing);
+  $('.eye-off', btn).classList.toggle('hidden', showing);
+  input.focus();
+});
 
 $('#tab-signin').addEventListener('click', () => setAuthMode('signin'));
 $('#tab-signup').addEventListener('click', () => setAuthMode('signup'));
@@ -301,14 +330,19 @@ function taskCard(task) {
   if (state.view === 'all' && task.createdById !== task.assigneeId)
     bits.push(`<span class="dot"></span><span>from ${esc(task.createdBy?.name?.split(' ')[0] || '?')}</span>`);
 
+  // No tick on the card. Tapping opens the task so it can be read before it is
+  // marked done — completing wipes the details, so it should never be one
+  // stray thumb away.
+  const initial = task.priority === 'high' ? '!' : (task.checklist || []).length ? '☰' : '·';
+
   return `
     <div class="task pri-${esc(task.priority)}${r.ms < 0 ? ' overdue' : ''}" data-id="${esc(task.id)}">
-      <button class="tick" data-complete="${esc(task.id)}" aria-label="Mark “${esc(task.title)}” done">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--teal-700)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-      </button>
-      <button class="task-body" data-open="${esc(task.id)}">
-        <div class="task-title">${esc(task.title)}</div>
-        <div class="task-meta">${bits.join('')}</div>
+      <button class="task-open" data-open="${esc(task.id)}" aria-label="Open “${esc(task.title)}”">
+        <span class="task-chip" aria-hidden="true">${initial}</span>
+        <span class="task-body">
+          <span class="task-title">${esc(task.title)}</span>
+          <span class="task-meta">${bits.join('')}</span>
+        </span>
       </button>
     </div>`;
 }
@@ -420,6 +454,7 @@ async function refreshTasks() {
   state.tasks = tasks;
   state.history = history;
   render();
+  scheduleReminders();
 }
 
 /* ───────────────────────── tabs ───────────────────────── */
@@ -707,9 +742,20 @@ async function completeTask(id, title) {
   const card = $(`.task[data-id="${CSS.escape(id)}"]`);
   if (card) card.classList.add('completing');
   try {
-    await api(`/tasks/${id}/complete`, { method: 'POST' });
+    const res = await api(`/tasks/${id}/complete`, { method: 'POST' });
     await refreshTasks();
-    toast(`“${title}” done — details wiped.`);
+    // The server hands the task back once and keeps no copy. If Undo isn't
+    // pressed before the toast goes, it really is gone.
+    toast(`“${title}” done.`, {
+      label: 'Undo',
+      run: async () => {
+        try {
+          await api('/tasks/restore', { method: 'POST', body: { task: res.undo, historyId: res.history?.id } });
+          await refreshTasks();
+          toast('Put back.');
+        } catch (err) { toast(err.message); }
+      },
+    });
   } catch (err) {
     card?.classList.remove('completing');
     toast(err.message);
@@ -717,12 +763,6 @@ async function completeTask(id, title) {
 }
 
 $('#view').addEventListener('click', (e) => {
-  const tick = e.target.closest('[data-complete]');
-  if (tick) {
-    const task = state.tasks.find((t) => t.id === tick.dataset.complete);
-    if (task) completeTask(task.id, task.title);
-    return;
-  }
   const open = e.target.closest('[data-open]');
   if (open) openDetail(open.dataset.open);
 });
@@ -794,11 +834,14 @@ function renderMembers() {
         <div class="em">${esc(m.user.email)}</div>
       </div>
       ${m.role === 'owner' ? '<span class="pill pill-mute">Owner</span>' : ''}
+      ${iAmOwner && m.role !== 'owner'
+        ? `<button class="btn btn-ghost btn-sm" data-makeowner="${esc(m.user.id)}">Make owner</button>` : ''}
       ${(iAmOwner && m.role !== 'owner') || m.user.id === state.user.id
         ? `<button class="btn btn-ghost btn-sm" data-remove="${esc(m.user.id)}">${m.user.id === state.user.id ? 'Leave' : 'Remove'}</button>` : ''}
     </div>`).join('');
 
   $('#invite-code').textContent = project.inviteCode;
+  renderInviteQr(project);
   $('#rotate-code').classList.toggle('hidden', !iAmOwner);
   $('#danger-block').classList.toggle('hidden', !iAmOwner);
   $('#invite-alert').classList.add('hidden');
@@ -811,6 +854,22 @@ $('#open-members').addEventListener('click', () => {
 });
 
 $('#member-list').addEventListener('click', async (e) => {
+  const hand = e.target.closest('[data-makeowner]');
+  if (hand) {
+    const project = activeProject();
+    const who = project.members.find((m) => m.user.id === hand.dataset.makeowner)?.user;
+    if (!confirm(`Make ${who?.name || 'them'} the owner of “${project.name}”?\n\nThey will be able to rename and delete the board, and remove people — including you. You stay on as a member.`)) return;
+    try {
+      const out = await api(`/projects/${project.id}/transfer-owner`, {
+        method: 'POST', body: { userId: hand.dataset.makeowner },
+      });
+      await loadAll();
+      renderMembers();
+      toast(out.message);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
   const btn = e.target.closest('[data-remove]');
   if (!btn) return;
   const uid = btn.dataset.remove;
@@ -846,7 +905,7 @@ $('#invite-form').addEventListener('submit', async (e) => {
 
 $('#copy-code').addEventListener('click', async () => {
   const project = activeProject();
-  const text = `Join my HomeBoard “${project.name}” — go to ${location.origin} and enter code ${project.inviteCode}`;
+  const text = `Join my HomeBoard “${project.name}”: ${joinLink(project)}\n\n(or enter the code ${project.inviteCode} yourself)`;
   try {
     if (navigator.share) await navigator.share({ title: 'HomeBoard invite', text });
     else { await navigator.clipboard.writeText(text); toast('Invite copied.'); }
@@ -906,6 +965,7 @@ $('#signout-btn').addEventListener('click', async () => {
   state.user = null;
   state.projects = [];
   state.tasks = [];
+  stopPolling();
   closeSheet();
   showAuth();
 });
@@ -934,6 +994,306 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
 }
 
+/* ───────────────────────── staying in sync ───────────────────────── */
+
+/*
+ * Two people on one board need to see each other's changes without being told
+ * to reload. There is a refresh button, a pull-to-refresh, a refresh whenever
+ * the app comes back to the foreground, and a quiet poll in between.
+ */
+const POLL_MS = 20000;
+let pollTimer = null;
+let refreshing = false;
+
+async function refreshNow({ silent = false } = {}) {
+  if (refreshing || !state.user) return;
+  refreshing = true;
+  const btn = $('#refresh-btn');
+  if (!silent) btn?.classList.add('spinning');
+  try {
+    await loadAll();
+    if (openSheet === $('#sheet-detail') && state.detailId) renderDetail();
+    if (openSheet === $('#sheet-members')) renderMembers();
+    scheduleReminders();
+  } catch {
+    // A failed poll is not worth interrupting anyone over; the next one retries.
+  } finally {
+    refreshing = false;
+    if (!silent) setTimeout(() => btn?.classList.remove('spinning'), 350);
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') refreshNow({ silent: true });
+  }, POLL_MS);
+}
+function stopPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+$('#refresh-btn').addEventListener('click', async () => {
+  await refreshNow();
+  toast('Up to date.');
+});
+
+/* Pull down at the top of the list to refresh. */
+(function pullToRefresh() {
+  const main = document.querySelector('main');
+  const indicator = document.createElement('div');
+  indicator.className = 'pull';
+  indicator.textContent = 'Pull to refresh';
+  main.prepend(indicator);
+
+  const THRESHOLD = 68;
+  let startY = 0;
+  let pulling = false;
+
+  main.addEventListener('touchstart', (e) => {
+    if (window.scrollY > 0 || e.touches.length !== 1) return;
+    startY = e.touches[0].clientY;
+    pulling = true;
+  }, { passive: true });
+
+  main.addEventListener('touchmove', (e) => {
+    if (!pulling) return;
+    const dy = e.touches[0].clientY - startY;
+    if (dy <= 0) { indicator.style.height = '0px'; return; }
+    const h = Math.min(dy * 0.45, 86);
+    indicator.style.height = `${h}px`;
+    const armed = h >= THRESHOLD * 0.45;
+    indicator.classList.toggle('armed', armed);
+    indicator.textContent = armed ? 'Release to refresh' : 'Pull to refresh';
+  }, { passive: true });
+
+  const end = async () => {
+    if (!pulling) return;
+    pulling = false;
+    const armed = indicator.classList.contains('armed');
+    indicator.style.height = '0px';
+    indicator.classList.remove('armed');
+    if (armed) { await refreshNow(); toast('Up to date.'); }
+  };
+  main.addEventListener('touchend', end);
+  main.addEventListener('touchcancel', end);
+})();
+
+/* ───────────────────────── reminders ───────────────────────── */
+
+/*
+ * On Android the Capacitor plugin schedules these with the operating system,
+ * so they arrive even when HomeBoard is closed. In a browser we can only use
+ * the Notifications API, which means the tab has to be open — so the copy in
+ * Settings says so rather than promising something we cannot deliver.
+ */
+const cap = () => window.Capacitor?.Plugins || null;
+const localNotifications = () => cap()?.LocalNotifications || null;
+const remindersOn = () => localStorage.getItem('hb.reminders') === '1';
+
+/** Stable 31-bit id per task, because the plugin wants integers. */
+function notifId(taskId) {
+  let h = 0;
+  for (let i = 0; i < taskId.length; i++) h = (h * 31 + taskId.charCodeAt(i)) | 0;
+  return Math.abs(h) % 2147483647;
+}
+
+const webTimers = new Map();
+
+function myUpcoming() {
+  return state.tasks.filter(
+    (t) => t.assigneeId === state.user?.id && t.dueAt && Date.parse(t.dueAt) > Date.now()
+  );
+}
+
+async function scheduleReminders() {
+  if (!state.user) return;
+  const ln = localNotifications();
+
+  if (!remindersOn()) {
+    if (ln) { try { await clearNative(ln); } catch {} }
+    for (const t of webTimers.values()) clearTimeout(t);
+    webTimers.clear();
+    return;
+  }
+
+  if (ln) {
+    try {
+      await clearNative(ln);
+      const notifications = myUpcoming().slice(0, 60).map((t) => ({
+        id: notifId(t.id),
+        title: t.title,
+        body: t.details ? t.details.slice(0, 120) : 'Due now on HomeBoard.',
+        schedule: { at: new Date(t.dueAt), allowWhileIdle: true },
+        smallIcon: 'ic_launcher',
+        extra: { taskId: t.id },
+      }));
+      if (notifications.length) await ln.schedule({ notifications });
+    } catch (err) {
+      console.warn('[HomeBoard] could not schedule reminders', err);
+    }
+    return;
+  }
+
+  // Browser fallback: only while the page is open.
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  for (const t of webTimers.values()) clearTimeout(t);
+  webTimers.clear();
+  for (const t of myUpcoming()) {
+    const delay = Date.parse(t.dueAt) - Date.now();
+    if (delay > 6 * 60 * 60 * 1000) continue;   // setTimeout that far out is unreliable
+    webTimers.set(t.id, setTimeout(() => {
+      try {
+        new Notification(t.title, { body: 'Due now on HomeBoard.', icon: '/icons/icon-192.png', tag: t.id });
+      } catch {}
+    }, Math.max(0, delay)));
+  }
+}
+
+async function clearNative(ln) {
+  const pending = await ln.getPending();
+  if (pending?.notifications?.length) await ln.cancel({ notifications: pending.notifications });
+}
+
+async function setReminders(on) {
+  if (!on) {
+    localStorage.setItem('hb.reminders', '0');
+    await scheduleReminders();
+    $('#reminders-toggle').checked = false;
+    updateRemindersNote();
+    return;
+  }
+
+  const ln = localNotifications();
+  let granted = false;
+  if (ln) {
+    const res = await ln.requestPermissions();
+    granted = res?.display === 'granted';
+  } else if ('Notification' in window) {
+    granted = (await Notification.requestPermission()) === 'granted';
+  }
+
+  if (!granted) {
+    $('#reminders-toggle').checked = false;
+    toast('Notifications are blocked. Turn them on for HomeBoard in your device settings.');
+    return;
+  }
+  localStorage.setItem('hb.reminders', '1');
+  await scheduleReminders();
+  updateRemindersNote();
+  toast('Reminders on.');
+}
+
+function updateRemindersNote() {
+  const note = $('#reminders-note');
+  if (!note) return;
+  note.textContent = localNotifications()
+    ? 'A notification when time runs out on anything assigned to you. Works with HomeBoard closed.'
+    : 'A notification when time runs out on anything assigned to you. In a browser this only fires while HomeBoard is open — install the app for reminders that always arrive.';
+}
+
+$('#reminders-toggle').addEventListener('change', (e) => setReminders(e.target.checked));
+
+/* ───────────────────────── QR invites ───────────────────────── */
+
+const joinLink = (project) => `${location.origin}/?join=${encodeURIComponent(project.inviteCode)}`;
+
+function renderInviteQr(project) {
+  const box = $('#invite-qr');
+  if (!box) return;
+  try {
+    box.innerHTML = window.HomeBoardQR.toSvg(joinLink(project), {
+      size: 184, margin: 2, dark: '#16302f', light: '#ffffff',
+    });
+  } catch (err) {
+    box.innerHTML = `<p class="qr-note">${esc(err.message)}</p>`;
+  }
+}
+
+$('#save-qr').addEventListener('click', () => {
+  const project = activeProject();
+  if (!project) return;
+  const svg = window.HomeBoardQR.toSvg(joinLink(project), { size: 640, margin: 3 });
+  const blob = new Blob([svg], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `homeboard-${project.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-invite.svg`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('QR saved.');
+});
+
+/** Someone scanned a code, or opened an invite link. */
+async function handleJoinLink() {
+  const code = new URLSearchParams(location.search).get('join');
+  if (!code) return;
+  history.replaceState({}, '', location.pathname);
+
+  if (!state.user) { localStorage.setItem('hb.pendingJoin', code); return; }
+  try {
+    const { project, message } = await api('/projects/join', { method: 'POST', body: { code } });
+    state.activeId = project.id;
+    await loadAll();
+    toast(message);
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function consumePendingJoin() {
+  const code = localStorage.getItem('hb.pendingJoin');
+  if (!code) return;
+  localStorage.removeItem('hb.pendingJoin');
+  try {
+    const { project, message } = await api('/projects/join', { method: 'POST', body: { code } });
+    state.activeId = project.id;
+    await loadAll();
+    toast(message);
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+/* ───────────────────────── leaving for good ───────────────────────── */
+
+$('#delete-account').addEventListener('click', async () => {
+  if (!confirm('Delete your HomeBoard account?\n\nThis removes your account, any board only you are on, and every task on it. It cannot be undone.')) return;
+  if (!confirm('Last check — this is permanent. Delete the account?')) return;
+  try {
+    const out = await api('/auth/me', { method: 'DELETE' });
+    setToken(null);
+    state.user = null;
+    state.projects = [];
+    state.tasks = [];
+    stopPolling();
+    closeSheet();
+    showAuth();
+    toast(out.boardsDeleted ? `Account deleted, along with ${out.boardsDeleted} board${out.boardsDeleted === 1 ? '' : 's'}.` : 'Account deleted.');
+  } catch (err) {
+    alert(err.message);
+  }
+});
+
+/* Closing the app, and making the Android back button behave. */
+(function androidShell() {
+  const App = cap()?.App;
+  if (!App) return;
+  $('#exit-btn').classList.remove('hidden');
+  $('#exit-btn').addEventListener('click', () => App.exitApp());
+  App.addListener('backButton', () => {
+    if (openSheet) { closeSheet(); return; }
+    if (state.view !== 'mine' && state.user) {
+      $$('.tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.view === 'mine')));
+      state.view = 'mine';
+      render();
+      return;
+    }
+    App.exitApp();
+  });
+})();
+
 /* ───────────────────────── boot ───────────────────────── */
 
 async function boot() {
@@ -942,16 +1302,33 @@ async function boot() {
   $('#app-screen').classList.remove('hidden');
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
   $('#my-avatar').textContent = initials(state.user.name);
+  $('#reminders-toggle').checked = remindersOn();
+  updateRemindersNote();
   await loadAll();
+  await consumePendingJoin();
+  scheduleReminders();
+  startPolling();
 }
 
 (async function start() {
-  if (!getToken()) { setAuthMode('signin'); showAuth(); return; }
+  if (!getToken()) {
+    const code = new URLSearchParams(location.search).get('join');
+    if (code) {
+      localStorage.setItem('hb.pendingJoin', code);
+      history.replaceState({}, '', location.pathname);
+      setAuthMode('signup');
+      $('#auth-note').textContent = 'Create your account and you will join the board straight away.';
+      showAuth();
+      return;
+    }
+    setAuthMode('signin'); showAuth(); return;
+  }
   try {
     const { user } = await api('/auth/me');
     if (!user?.id) throw new Error('no account returned');
     state.user = user;
     await boot();
+    await handleJoinLink();
   } catch (err) {
     setToken(null);
     setAuthMode('signin');
@@ -969,6 +1346,6 @@ async function boot() {
 
 // Pull fresh data when the app comes back to the foreground.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.user) refreshTasks().catch(() => {});
+  if (document.visibilityState === 'visible' && state.user) refreshNow({ silent: true });
 });
 })();

@@ -23,15 +23,24 @@ stays clean but you can still see who did what.
 
 ## What it does
 
-- **Sign up / sign in** — email + password, bcrypt-hashed, JWT sessions that last 30 days.
-- **Boards** — one board per household or project. Invite by email, or share an 8-character join code.
+- **Sign up / sign in** — email + password, bcrypt-hashed, JWT sessions that last 30 days, with a
+  show-password toggle because phone keyboards lie.
+- **Boards** — one board per household or project. Invite by email, by 8-character code, or by **QR**.
 - **Push a task to someone** — pick any member as the owner. It lands on their "For me" tab.
 - **Live countdown** — `2h 23m left`, `5h overdue`. Colour-coded, refreshes on its own.
+- **Reminders** — a real notification when time runs out. On Android these are scheduled with the
+  operating system, so they arrive with HomeBoard closed.
+- **Stays in sync** — everyone's board updates on its own. Poll every 20 seconds while the app is
+  open, plus a refresh button, pull-to-refresh, and a refresh whenever you come back to it.
 - **Details** — free-text notes, a checklist of steps, priority, and a due date with one-tap presets.
 - **Track** — tabs for *For me*, *Whole board*, *I assigned*, and *Finished*.
-- **Hand off** — reassign a task to someone else from inside it.
+- **Hand off** — reassign a task from inside it, or hand the whole board to someone else.
 - **Notes** — a comment thread per task, so "where's the key?" doesn't become a phone call.
+- **Read before you finish** — tapping a task opens it. Completing happens from inside, and offers
+  an **Undo** for a few seconds, because completing wipes the details.
 - **Complete = purge** — details, steps and notes are deleted; a name-only line goes into Finished.
+- **Leave properly** — leave a board, hand it over, delete your account and everything on it, or
+  close the app from inside it.
 - **Works offline** — the app shell is cached; it opens instantly and survives a dead signal.
 - **Light and dark** — follows the system, or force one in Account.
 
@@ -140,6 +149,15 @@ cd android && ./gradlew assembleDebug
 # → android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+**Build on JDK 17, not 21.** Capacitor 6 generates a Gradle 8.2.1 project, and
+Gradle only runs on Java 21 from 8.5 onwards, so a newer JDK fails the build
+with "Unsupported Java". The workflow pins 17; `setup-android.sh` checks your
+local JDK and stops if it's too new.
+
+The `android/` folder is generated, not committed — `cap add android` rebuilds
+it from `capacitor.config.json` and `public/` every time, so there's no native
+project to keep in sync.
+
 For Play Store you'll need `assembleRelease` with your own signing key — the
 debug APK is for sideloading only.
 
@@ -187,7 +205,19 @@ dead package:
 ```
 </details>
 
-### 6. The cold start, and what to do about it
+### 6. Reminders
+
+Turn them on in **Account → Remind me when a task is due**.
+
+In the APK they are scheduled with Android itself, so they arrive whether or not HomeBoard is
+running. In a browser they use the Notifications API, which can only fire while the page is open —
+the toggle's own description says which one you're getting, so nobody is promised something the
+platform won't deliver. Install the app if you want reminders that always arrive.
+
+The APK build adds `@capacitor/local-notifications` and `@capacitor/app` for this and for the
+Android back button. Both are pulled in at build time; there is nothing to install by hand.
+
+### 7. The cold start, and what to do about it
 
 A free Render service spins down after about 15 minutes with no traffic. The
 next request wakes it, which takes 30–50 seconds, and while that happens Render
@@ -242,15 +272,17 @@ npm start &
 npm run smoke
 ```
 
-That runs 30 assertions across signup, invites, assignment, permission
-boundaries, and the complete-and-purge behaviour.
+That runs 46 assertions across signup, invites, assignment, permission
+boundaries, undo, ownership transfer, account deletion, and the
+complete-and-purge behaviour.
 
 Two more suites:
 
 ```bash
 npm run test:store   # the GitHub datastore against a fake Contents API —
                      # sha conflicts, 20 concurrent writers, queue recovery
-npm run test:ui      # 21 real browser assertions through the whole UI
+npm run test:qr      # the QR encoder against verified golden matrices
+npm run test:ui      # 42 real browser assertions through the whole UI
                      # (needs: npm i --no-save playwright && npx playwright install chromium)
 ```
 
@@ -289,11 +321,14 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/projects/join` | join with a code |
 | `POST` | `/projects/:id/rotate-code` | new join code (owner) |
 | `DELETE` | `/projects/:id/members/:userId` | remove someone, or leave |
+| `POST` | `/projects/:id/transfer-owner` | hand the board to another member |
+| `DELETE` | `/auth/me` | delete the account and everything only it owns |
 | `GET` | `/tasks` | live tasks on your boards |
 | `POST` | `/tasks` | create / push to someone |
 | `PATCH` | `/tasks/:id` | edit, reassign, tick a step |
 | `POST` | `/tasks/:id/comments` | add a note |
 | `POST` | `/tasks/:id/complete` | **delete the task**, keep a name-only record |
+| `POST` | `/tasks/restore` | undo a completion (the task comes back from the client) |
 | `DELETE` | `/tasks/:id` | delete with no record |
 | `GET` | `/tasks/history/list` | what's been finished |
 | `GET` | `/health` | status + which storage backend is live |
@@ -328,7 +363,9 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 - Passwords: bcrypt, cost 10. Sign-in runs a compare even when the email doesn't
   exist, so response timing doesn't leak which emails are registered.
 - Sessions: signed JWTs, `httpOnly` `SameSite=Lax` cookie, `Secure` in production.
-- Rate limits: 20 auth attempts per IP per 15 minutes, 300 API calls per minute.
+- Rate limits: 30 **failed** auth attempts per IP per 15 minutes, 300 API calls per minute.
+  Successful sign-ins don't count, because everyone in one house shares a public IP and a flat cap
+  locks out the third person trying to sign up. Override with `AUTH_RATE_LIMIT`.
 - Every task and board route checks membership before it reads or writes anything.
 - Anyone holding a board's join code can join that board — treat it like a door key,
   and use **Reset code** if it gets out.
@@ -345,6 +382,7 @@ server/
 public/
   index.html        the whole UI shell
   app.js            front end — vanilla JS, no framework, no build step
+  qr.js             QR encoder, written out in full so invites work offline
   app.css           design system, light + dark
   sw.js             offline shell cache (serves the shell before the network)
   config.js         API base URL — empty for web, written by the Android build
@@ -353,6 +391,7 @@ public/
 scripts/
   smoke-test.js     30 end-to-end API assertions
   store-test.js     GitHub datastore under conflict + concurrency
+  qr-test.js        QR encoder against verified golden matrices
   ui-test.js        21 browser assertions through the real UI
   android-sim.js    stands in for the APK — own origin, sleeping host
   setup-android.sh  builds the native project

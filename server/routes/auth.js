@@ -9,12 +9,21 @@ const {
 
 const router = express.Router();
 
+/*
+ * Brute-force protection that counts only FAILED attempts.
+ *
+ * Everyone in one household shares a public IP, so a flat cap on all auth
+ * requests locks out the third person trying to sign up on the sofa. Counting
+ * failures keeps the protection where it belongs — on guessing — and lets a
+ * family get set up together.
+ */
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: Number(process.env.AUTH_RATE_LIMIT || 30),
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many attempts. Try again in a few minutes.' },
+  message: { error: 'Too many failed attempts. Try again in a few minutes.' },
 });
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -87,6 +96,63 @@ router.post('/signout', (req, res) => {
 
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
+});
+
+/**
+ * Delete the account and everything tied to it.
+ *
+ * Boards you own alone go with you. Boards you own with other people do not —
+ * we refuse and tell you to hand them over first, because silently deleting
+ * somebody else's shared board would be indefensible.
+ */
+router.delete('/me', requireAuth, async (req, res, next) => {
+  try {
+    const me = req.user.id;
+    const projects = await store.read('projects');
+
+    const ownedWithOthers = projects.filter((p) => p.ownerId === me && p.members.length > 1);
+    if (ownedWithOthers.length) {
+      return res.status(409).json({
+        error:
+          `You still own ${ownedWithOthers.length === 1 ? 'a board' : `${ownedWithOthers.length} boards`} with other people on ` +
+          `${ownedWithOthers.length === 1 ? 'it' : 'them'}: ${ownedWithOthers.map((p) => `"${p.name}"`).join(', ')}. ` +
+          'Hand ownership over, or remove everyone else, then delete your account.',
+        boards: ownedWithOthers.map((p) => ({ id: p.id, name: p.name })),
+      });
+    }
+
+    const soleBoards = projects.filter((p) => p.ownerId === me).map((p) => p.id);
+
+    await store.update('projects', (rows) => {
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (soleBoards.includes(rows[i].id)) { rows.splice(i, 1); continue; }
+        rows[i].members = rows[i].members.filter((m) => m.userId !== me);
+      }
+    }, 'HomeBoard: account deleted — memberships removed');
+
+    await store.update('tasks', (rows) => {
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (soleBoards.includes(rows[i].projectId)) { rows.splice(i, 1); continue; }
+        if (rows[i].assigneeId === me) rows[i].assigneeId = null;
+      }
+    }, 'HomeBoard: account deleted — tasks cleared');
+
+    await store.update('history', (rows) => {
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (soleBoards.includes(rows[i].projectId)) rows.splice(i, 1);
+      }
+    }, 'HomeBoard: account deleted — history cleared');
+
+    await store.update('users', (rows) => {
+      const i = rows.findIndex((u) => u.id === me);
+      if (i !== -1) rows.splice(i, 1);
+    }, 'HomeBoard: account deleted');
+
+    clearAuthCookie(res);
+    res.json({ ok: true, boardsDeleted: soleBoards.length });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

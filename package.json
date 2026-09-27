@@ -15,7 +15,8 @@
     "cap:open": "npx cap open android",
     "test:store": "node scripts/store-test.js",
     "test:ui": "node scripts/ui-test.js",
-    "test:android": "node scripts/android-sim.js"
+    "test:android": "node scripts/android-sim.js",
+    "test:qr": "node scripts/qr-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

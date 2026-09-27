@@ -25,6 +25,20 @@ case "$APP_URL" in
 esac
 APP_URL="${APP_URL%/}"
 
+# Capacitor 6 generates a Gradle 8.2.1 project, and Gradle only runs on Java 21
+# from 8.5 onwards. Catch the mismatch here rather than 40 lines into a build.
+if command -v java >/dev/null 2>&1; then
+  # Don't use `head -1` — some JVMs print a "Picked up JAVA_TOOL_OPTIONS" banner
+  # before the version line. Match the version line itself.
+  JAVA_MAJOR="$(java -version 2>&1 | grep -oE '(openjdk|java) version "[0-9]+' | grep -oE '[0-9]+$' | head -1)"
+  if [ -n "$JAVA_MAJOR" ] && [ "$JAVA_MAJOR" -ge 21 ]; then
+    echo "!! You are on Java $JAVA_MAJOR. Capacitor 6 builds on Gradle 8.2.1,"
+    echo "   which does not run on Java 21 or newer. Use JDK 17:"
+    echo "     export JAVA_HOME=/path/to/jdk-17"
+    exit 1
+  fi
+fi
+
 echo "==> Checking $APP_URL/api/health"
 if ! curl -fsS --max-time 90 "$APP_URL/api/health" | grep -q '"app":"HomeBoard"'; then
   echo "!! That URL did not answer as a HomeBoard server."
@@ -40,7 +54,8 @@ window.HOMEBOARD_API = "$APP_URL";
 CONFIG
 
 echo "==> Installing Capacitor"
-npm install --no-save @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets@3
+npm install --no-save @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets@3 \
+  @capacitor/local-notifications@6 @capacitor/app@6
 
 echo "==> Creating the android/ project"
 [ -d android ] || npx cap add android
