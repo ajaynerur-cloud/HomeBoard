@@ -258,6 +258,20 @@
 </section>
 
 <!-- account -->
+<section class="sheet" id="sheet-notify" role="dialog" aria-modal="true" aria-labelledby="notify-title">
+  <div class="grip"></div>
+  <div class="sheet-head">
+    <h2 id="notify-title">Turn on notifications</h2>
+    <button class="close-x" data-close aria-label="Close">✕</button>
+  </div>
+  <div class="sheet-body" style="text-align:center">
+    <img src="/icons/icon-192.png" alt="" width="64" height="64" style="border-radius:16px;margin:4px auto 14px;display:block">
+    <p id="notify-text" style="margin:0 0 18px;color:var(--ink-2)">So you know the moment someone adds a task for you — even with HomeBoard closed.</p>
+    <button type="button" class="btn btn-primary btn-block" id="notify-go">Turn on notifications</button>
+    <button type="button" class="btn btn-ghost btn-block" id="notify-later" style="margin-top:8px">Not now</button>
+  </div>
+</section>
+
 <section class="sheet" id="sheet-account" role="dialog" aria-modal="true" aria-labelledby="account-heading">
   <div class="grip"></div>
   <div class="sheet-head">
@@ -287,6 +301,10 @@
         <button type="button" class="btn btn-primary btn-sm hidden" id="push-allow">Allow notifications</button>
         <button type="button" class="btn btn-sm hidden" id="push-test">Send me a test</button>
       </div>
+      <details class="help" id="push-diag-wrap" style="margin-top:12px">
+        <summary>Troubleshoot notifications</summary>
+        <pre id="push-diag" style="white-space:pre-wrap;font-size:12px;margin:8px 0 0">Loading…</pre>
+      </details>
     </div>
     <div class="detail-block">
       <h4>Reminders</h4>

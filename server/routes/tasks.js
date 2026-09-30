@@ -99,7 +99,7 @@ router.post('/', async (req, res, next) => {
 
     // Tell the person it was pushed to, straight away. Not awaited: a slow push
     // service must never hold up the person creating the task.
-    push.notifyAssigned(task, { byUser: req.user, projectName: project.name });
+    push.notifyAssigned(task, { byUser: req.user, projectName: project.name, fromDevice: req.get('x-hb-device') || null });
     const [decorated] = await decorate([task]);
     res.status(201).json({ task: decorated });
   } catch (err) {
@@ -142,7 +142,9 @@ router.patch('/:id', async (req, res, next) => {
 
     // Handed to someone new — that is a new task on their plate.
     if (out.task.assigneeId && out.task.assigneeId !== existing.assigneeId) {
-      push.notifyAssigned(out.task, { byUser: req.user, projectName: project.name, reassigned: true });
+      push.notifyAssigned(out.task, {
+        byUser: req.user, projectName: project.name, reassigned: true, fromDevice: req.get('x-hb-device') || null,
+      });
     }
 
     const [decorated] = await decorate([out.task]);

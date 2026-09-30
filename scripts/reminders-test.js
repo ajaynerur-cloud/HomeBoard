@@ -9,6 +9,17 @@
 const { chromium } = require('playwright');
 const BASE = process.argv[2] || 'http://localhost:3000';
 
+// The "Turn on notifications" sheet appears after sign-in in a browser; these
+// flows aren't about that, so it is answered "Not now" whenever it shows.
+const AUTO_NOT_NOW = `
+  document.addEventListener('DOMContentLoaded', () => {
+    new MutationObserver(() => {
+      if (document.querySelector('#sheet-notify.open')) document.querySelector('#notify-later')?.click();
+    }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+  });
+`;
+
+
 let pass = 0, fail = 0;
 const check = (l, c, d) => c
   ? (pass++, console.log(`  \x1b[32m✓\x1b[0m ${l}`))
@@ -63,6 +74,7 @@ async function signedInPage(browser, init, { grantOnAsk = true } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 430, height: 932 } });
   const page = await ctx.newPage();
   await page.addInitScript(init);
+  await page.addInitScript(AUTO_NOT_NOW);
   await page.addInitScript(`window.addEventListener('DOMContentLoaded', () => { if (window.__hb) window.__hb.grantOnAsk = ${grantOnAsk}; });`);
 
   const email = `rem.${Date.now()}.${Math.random().toString(36).slice(2, 7)}@demo.com`;
@@ -108,22 +120,20 @@ async function signedInPage(browser, init, { grantOnAsk = true } = {}) {
     p.on('pageerror', (e) => errs.push(e.message));
 
     await p.click('#open-account'); await p.waitForTimeout(600);
-    check('the toggle starts off', await p.isChecked('#reminders-toggle') === false);
+    const st = await p.evaluate(() => window.__hb);
+    // Permission is asked for straight after sign-in now, and once it is
+    // granted reminders switch on by default — no toggle hunt.
+    check('signing in asks the system for permission, once', st.asked === 1, `asked ${st.asked}`);
     check('the copy promises background delivery on Android',
           (await p.textContent('#reminders-note')).includes('HomeBoard closed'));
-    check('the lead-time control is hidden until reminders are on',
-          await p.locator('#lead-field.hidden').count() === 1);
-
-    await p.click('#reminders-toggle');
-    await p.waitForTimeout(1500);
-    const st = await p.evaluate(() => window.__hb);
-    check('turning it on asks the system for permission', st.asked === 1, `asked ${st.asked}`);
-    check('the toggle stays on once granted', await p.isChecked('#reminders-toggle'));
-    check('the lead-time control appears', await p.locator('#lead-field.hidden').count() === 0);
+    check('reminders are on without touching the toggle', await p.isChecked('#reminders-toggle'));
+    check('the lead-time control is showing', await p.locator('#lead-field.hidden').count() === 0);
     check('the background-apps help appears', await p.locator('#battery-help.hidden').count() === 0);
 
+    const reminderChannel = st.channels.find((c) => c.id === 'homeboard-reminders');
     check('a high-importance channel is created for reminders',
-          st.channels.length === 1 && st.channels[0].importance === 5, JSON.stringify(st.channels));
+          reminderChannel?.importance === 5, JSON.stringify(st.channels));
+    check('and one for new tasks', st.channels.some((c) => c.id === 'homeboard-tasks' && c.importance === 5));
     check('a Snooze action is registered',
           st.actionTypes[0]?.actions?.some((a) => a.id === 'SNOOZE' && /10 min/.test(a.title)),
           JSON.stringify(st.actionTypes));
@@ -251,6 +261,9 @@ async function signedInPage(browser, init, { grantOnAsk = true } = {}) {
     const p = await signedInPage(b, fakePlugin({ permission: 'granted', exact: 'denied' }));
     p.on('pageerror', (e) => errs.push(e.message));
     await p.click('#open-account'); await p.waitForTimeout(600);
+    // Already on from sign-in; switch it off and on again to see the warning.
+    await p.click('#reminders-toggle');
+    await p.waitForTimeout(800);
     await p.click('#reminders-toggle');
     await p.waitForTimeout(1500);
     check('reminders still turn on', await p.isChecked('#reminders-toggle'));
@@ -269,8 +282,7 @@ async function signedInPage(browser, init, { grantOnAsk = true } = {}) {
     const p = await signedInPage(b, fakePlugin({ permission: 'granted' }));
     p.on('pageerror', (e) => errs.push(e.message));
     await p.click('#open-account'); await p.waitForTimeout(500);
-    await p.click('#reminders-toggle'); await p.waitForTimeout(1200);
-    check('reminders are on before the revoke', await p.isChecked('#reminders-toggle'));
+    check('reminders are on before the revoke (on by default once allowed)', await p.isChecked('#reminders-toggle'));
 
     await p.evaluate(() => { window.__hb.permission = 'denied'; });
     await p.keyboard.press('Escape'); await p.waitForTimeout(300);

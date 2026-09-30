@@ -97,10 +97,14 @@ function selfSigned(dir) {
   server.stderr.on('data', (d) => (log += d));
 
   const BASE = `http://localhost:${APP_PORT}/api`;
-  const call = async (p, { method = 'GET', body, token } = {}) => {
+  const call = async (p, { method = 'GET', body, token, device } = {}) => {
     const res = await fetch(BASE + p, {
       method,
-      headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      headers: {
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(device ? { 'X-HB-Device': device } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
     let data = {}; try { data = await res.json(); } catch {}
@@ -177,11 +181,22 @@ function selfSigned(dir) {
       }
     }
 
-    /* Assigning to yourself is not news. */
+    /* Adding a task for yourself: your other devices hear, the one you used doesn't. */
     deliveries.length = 0;
-    await call('/tasks', { method: 'POST', token: bob.token, body: { projectId: board.id, title: 'Buy milk' } });
+    await call('/tasks', { method: 'POST', token: bob.token, device: sub.data.id, body: { projectId: board.id, title: 'Buy milk' } });
     await sleep(400);
-    check('no push when you add a task for yourself', deliveries.length === 0);
+    check('adding a task for yourself does not buzz the device you added it on', deliveries.length === 0);
+    deliveries.length = 0;
+    await call('/tasks', { method: 'POST', token: bob.token, device: 'some-other-device', body: { projectId: board.id, title: 'Buy eggs' } });
+    for (let i = 0; i < 40 && !deliveries.length; i++) await sleep(50);
+    check('…but it does reach your other devices (add on laptop → phone buzzes)', deliveries.length === 1);
+    if (deliveries[0]) check('…titled for a task you gave yourself', decrypt(deliveries[0]).title === 'New task on your plate');
+
+    const st = await call('/push/status', { token: bob.token });
+    check('status lists this account\'s devices', st.data.devices?.length === 1 && st.data.web === true, JSON.stringify(st.data));
+    check('…with how the last push went', st.data.devices?.[0]?.last?.ok === true);
+    const cors = await fetch(BASE + '/tasks', { method: 'OPTIONS', headers: { Origin: 'https://localhost', 'Access-Control-Request-Headers': 'x-hb-device' } });
+    check('the APK is allowed to send the device header cross-origin', /X-HB-Device/i.test(cors.headers.get('access-control-allow-headers') || ''));
 
     /* A task Alice keeps, then hands to Bob. */
     const mine = (await call('/tasks', { method: 'POST', token: alice.token, body: { projectId: board.id, title: 'Call the landlord' } })).data.task;

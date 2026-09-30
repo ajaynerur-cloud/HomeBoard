@@ -251,13 +251,31 @@ When someone adds a task for you, or hands you one, the server pushes a notifica
 device you're signed in on — *"New task from Alice · Take the bins out — Home"*. Tapping it opens
 that task. It arrives with HomeBoard closed, swiped away, or not opened since a restart.
 
-**Permission is asked for straight after sign-in** — there's no switch to find first. If the
-person ignores the prompt, a banner stays at the top of the board and the next tap anywhere asks
-again. Android 13+ and every browser still require the person to tap *Allow* once — no app can
-grant itself that permission; on Android 12 and older it is on from install. Once it's allowed,
-due-date reminders switch on too, unless someone has turned them off.
+**Permission is asked for straight after sign-in.**
 
-**Account → New tasks** shows whether it's working, and has a *Send me a test* button.
+- **APK:** Android's own *"Allow HomeBoard to send notifications?"* dialog appears by itself.
+- **Browser, phone or desktop:** a *Turn on notifications* sheet appears; tapping its button shows
+  the browser's prompt. (Browsers — Chrome on Android especially — block or silently hide a prompt
+  that isn't triggered by a tap, which is why an automatic prompt alone doesn't work.) It comes back
+  on every launch, and a banner stays on the board, until notifications are on.
+- **Blocked?** The sheet says exactly where to unblock it for that device.
+- **iPhone:** Safari only allows web notifications from the Home Screen app, so the sheet explains
+  *Share → Add to Home Screen* first.
+
+Nothing can tap *Allow* for the person — every platform requires that one tap (Android 12 and
+older have no prompt; notifications are on from install). Once allowed, due-date reminders switch on
+too, unless someone has turned them off.
+
+**Adding a task for yourself** buzzes your *other* devices (add it on the laptop, the phone rings),
+never the one you added it on.
+
+**Backstop.** While HomeBoard is open or in the background, any task newly put on your plate also
+raises a notification on the device itself — so a device that couldn't register for push still hears
+about it whenever the app is alive.
+
+**Account → New tasks** shows whether it's working, has a *Send me a test* button, and a
+**Troubleshoot notifications** panel listing each registered device and how the last push to it
+went (delivered, or the exact error the push service gave).
 
 | Where | How it's delivered | Setup |
 |---|---|---|
@@ -351,6 +369,8 @@ Two more suites:
 npm run test:store   # the GitHub datastore against a fake Contents API —
                      # sha conflicts, 20 concurrent writers, queue recovery
 npm run test:qr      # the QR encoder against verified golden matrices
+node scripts/push-android-test.js  # the APK half, plugins stood in for: native prompt
+                     # at sign-in, Firebase token, no-Firebase fallback, cold-start tap
 npm run test:push    # new-task push end to end: real encryption against a fake push
                      # service, and FCM against a stand-in Google (HB_TEST_FCM=1)
 node scripts/push-ui-test.js  # the browser half in Chromium: prompt on sign-in,
@@ -411,6 +431,7 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/push/subscribe` | register this device (`{kind:'web', subscription}` or `{kind:'fcm', token}`) |
 | `POST` | `/push/unsubscribe` | stop pushing to this device (done on sign-out) |
 | `POST` | `/push/test` | send yourself a test notification |
+| `GET` | `/push/status` | your registered devices and the last delivery result for each |
 | `GET` | `/health` | status, storage backend, and which push channels are live |
 
 ## What's stored

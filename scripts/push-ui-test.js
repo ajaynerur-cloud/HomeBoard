@@ -75,22 +75,68 @@ const STUB_SUBSCRIBE = `
 
   console.log('\nNew-task push in the browser\n');
 
-  /* 1. Permission not yet decided: sign-in asks, with no switch involved. */
+  const signIn = async (p) => {
+    await p.goto(BASE);
+    await p.fill('input[name=email]', `pb.${stamp}@example.com`);
+    await p.fill('input[name=password]', 'household123');
+    await p.click('#auth-submit');
+    await p.waitForSelector('#app-screen:not(.hidden)', { timeout: 15000 });
+  };
+  const ANDROID_CHROME = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36';
+  const IPHONE_SAFARI = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+
+  /* 1. Mobile browser tab, permission not decided: sign-in shows the ask, the tap asks. */
   {
-    const ctx = await b.newContext();
+    const ctx = await b.newContext({ userAgent: ANDROID_CHROME, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true });
     await ctx.addInitScript(STUB_SUBSCRIBE);
     const p = await ctx.newPage();
-    await p.goto(BASE);
-    await p.fill('input[name=email]', `pb.${stamp}@example.com`).catch(() => {});
-    await p.fill('input[name=password]', 'household123').catch(() => {});
-    await p.click('#auth-submit').catch(() => {});
-    await p.waitForSelector('#app-screen:not(.hidden)', { timeout: 15000 });
-    await sleep(800);
-    const asked = await p.evaluate(() => window.__askCount);
-    check('signing in asks for notification permission straight away', asked >= 1, `asked ${asked} times`);
-    const banner = await p.isVisible('#push-banner');
-    const perm = await p.evaluate(() => Notification.permission);
-    check(`until it is allowed, a banner stays up (permission: ${perm})`, perm === 'granted' ? !banner : banner);
+    await signIn(p);
+    await p.waitForSelector('#sheet-notify.open', { timeout: 5000 }).catch(() => {});
+    check('phone browser: signing in brings up "Turn on notifications"', await p.isVisible('#sheet-notify.open'));
+    check('…and does not fire a prompt without a tap (Chrome would block it)', (await p.evaluate(() => window.__askCount)) === 0);
+    await p.click('#notify-go');
+    await sleep(500);
+    check('tapping the button shows the browser\'s permission prompt', (await p.evaluate(() => window.__askCount)) === 1);
+    await ctx.close();
+  }
+
+  /* 1b. Blocked on a phone: say exactly where to unblock it. */
+  {
+    const ctx = await b.newContext({ userAgent: ANDROID_CHROME, isMobile: true, hasTouch: true });
+    await ctx.addInitScript(STUB_SUBSCRIBE + `Object.defineProperty(Notification, 'permission', { get: () => 'denied' });`);
+    const p = await ctx.newPage();
+    await signIn(p);
+    await p.waitForSelector('#sheet-notify.open', { timeout: 5000 }).catch(() => {});
+    const t = await p.textContent('#notify-text').catch(() => '');
+    check('blocked in Chrome on Android: shows how to allow it', /Permissions → Notifications → Allow/.test(t), t);
+    await ctx.close();
+  }
+
+  /* 1c. iPhone Safari tab: push needs the Home Screen app, so say that. */
+  {
+    const ctx = await b.newContext({ userAgent: IPHONE_SAFARI, isMobile: true, hasTouch: true });
+    await ctx.addInitScript(STUB_SUBSCRIBE);
+    const p = await ctx.newPage();
+    await signIn(p);
+    await p.waitForSelector('#sheet-notify.open', { timeout: 5000 }).catch(() => {});
+    const t = await p.textContent('#notify-text').catch(() => '');
+    check('iPhone Safari tab: explains Add to Home Screen', /Add to Home Screen/.test(t), t);
+    await ctx.close();
+  }
+
+  /* 1d. Push unavailable, app open: still hears about a new task. */
+  {
+    const ctx = await b.newContext({ permissions: ['notifications'] });
+    await ctx.addInitScript(STUB_SUBSCRIBE + `PushManager.prototype.subscribe = async () => { throw new Error('push service unreachable'); };`);
+    const p = await ctx.newPage();
+    await signIn(p);
+    await sleep(1200);
+    check('if push cannot register, the banner says so', await p.isVisible('#push-banner'));
+    await api('/tasks', { method: 'POST', token: alice.token, body: { projectId: project.id, title: 'Defrost the freezer', assigneeId: bob.user.id } });
+    await p.click('#refresh-btn');
+    await sleep(1000);
+    const toastText = await p.evaluate(() => document.body.innerText);
+    check('…and a new task from someone else still shows up as an alert in the app', /New task from Alice — Defrost the freezer/.test(toastText));
     await ctx.close();
   }
 

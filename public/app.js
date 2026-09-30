@@ -51,6 +51,8 @@ async function api(path, { method = 'GET', body } = {}) {
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
+  const device = localStorage.getItem('hb.pushDevice');
+  if (device) headers['X-HB-Device'] = device;
 
   const started = Date.now();
   let attempt = 0;
@@ -226,11 +228,13 @@ function sheet(id) {
   openSheet = el;
   document.body.style.overflow = 'hidden';
 }
+let afterSheetClosed = null;
 function closeSheet() {
   if (openSheet) openSheet.classList.remove('open');
   $('#scrim').classList.remove('open');
   openSheet = null;
   document.body.style.overflow = '';
+  if (afterSheetClosed) { const fn = afterSheetClosed; afterSheetClosed = null; setTimeout(fn, 500); }
 }
 $('#scrim').addEventListener('click', closeSheet);
 document.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) closeSheet(); });
@@ -454,6 +458,7 @@ async function refreshTasks() {
   state.tasks = tasks;
   state.history = history;
   render();
+  noticeNewTasks();
   scheduleReminders();
 }
 
@@ -953,6 +958,7 @@ $('#theme-seg').addEventListener('click', (e) => {
 $('#open-account').addEventListener('click', () => {
   syncRemindersToggle();
   updatePushUi();
+  if ($('#push-diag-wrap')?.open) renderPushDiagnostics();
   const av = $('#acct-avatar');
   av.style.background = state.user.avatarColor || '#0f766e';
   av.textContent = initials(state.user.name);
@@ -1017,6 +1023,7 @@ async function refreshNow({ silent = false } = {}) {
     await loadAll();
     if (openSheet === $('#sheet-detail') && state.detailId) renderDetail();
     if (openSheet === $('#sheet-members')) renderMembers();
+    noticeNewTasks();
     scheduleReminders();
   } catch {
     // A failed poll is not worth interrupting anyone over; the next one retries.
@@ -1028,8 +1035,15 @@ async function refreshNow({ silent = false } = {}) {
 
 function startPolling() {
   stopPolling();
+  let lastHidden = 0;
   pollTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') refreshNow({ silent: true });
+    if (document.visibilityState === 'visible') { refreshNow({ silent: true }); return; }
+    // In the background, keep a slower watch for new tasks on devices that
+    // push can't reach — the only way they hear about one while not in front.
+    if (pushState !== 'on' && Date.now() - lastHidden > 60000) {
+      lastHidden = Date.now();
+      refreshNow({ silent: true });
+    }
   }, POLL_MS);
 }
 function stopPolling() {
@@ -1038,8 +1052,10 @@ function stopPolling() {
 }
 
 $('#refresh-btn').addEventListener('click', async () => {
+  const before = $('#toast-text').textContent;
   await refreshNow();
-  toast('Up to date.');
+  // Don't talk over a "New task from…" alert the refresh just raised.
+  if ($('#toast-text').textContent === before || !$('#toast').classList.contains('show')) toast('Up to date.');
 });
 
 /* Pull down at the top of the list to refresh. */
@@ -1300,7 +1316,7 @@ async function clearNative(ln, { includeSnoozes = false } = {}) {
   if (list.length) await ln.cancel({ notifications: list });
 }
 
-async function setReminders(on) {
+async function setReminders(on, { quiet = false } = {}) {
   const toggle = $('#reminders-toggle');
 
   if (!on) {
@@ -1370,7 +1386,7 @@ async function setReminders(on) {
       }
     } catch { /* older plugin builds don't have this; not worth failing over */ }
   }
-  toast('Reminders on.');
+  if (!quiet) toast('Reminders on.');
 }
 
 /**
@@ -1442,29 +1458,40 @@ function updateLeadHint() {
 
 /*
  * A reminder is something the phone can schedule by itself. A task someone has
- * just put on your plate is not — the server has to tell the phone. So:
+ * just put on your plate is not — the server has to tell the phone:
  *
  *   APK      Firebase Cloud Messaging via @capacitor/push-notifications. Android
- *            draws the notification itself, so it arrives with HomeBoard
- *            closed, swiped away, or not opened since the phone restarted.
+ *            draws the notification itself, so it arrives with HomeBoard closed.
  *   Browser  Web Push. The browser wakes our service worker to show it, so no
  *            HomeBoard tab has to be open.
  *
- * Permission is asked for straight after sign-in — nobody has to find a switch
- * first. Browsers and Android still insist the person taps "Allow" once; no
- * app can skip that. If the first ask is ignored, the next tap anywhere in the
- * app asks again, and a banner stays up until it is answered.
+ * Permission:
+ *   APK      Android's own "Allow HomeBoard to send notifications?" dialog is
+ *            shown straight after sign-in.
+ *   Browser  Browsers (Chrome on Android above all) only show the prompt, or
+ *            quietly block it, unless it comes from a tap. So straight after
+ *            sign-in we show our own "Turn on notifications" sheet, and the tap
+ *            on its button is what asks. It comes back on every launch until
+ *            notifications are on.
+ *
+ * Backstop: while HomeBoard is open or in the background, anything newly put on
+ * your plate also raises a local notification — so a device that could not
+ * register for push (no Firebase in this APK, iPhone Safari tab, a blocked push
+ * service) still hears about it whenever the app is alive.
  */
 const pushNative = () => cap()?.PushNotifications || null;
-const isNativeApp = () => Boolean(window.Capacitor?.isNativePlatform?.());
+const isNativeApp = () => Boolean(window.Capacitor?.isNativePlatform?.() || cap()?.LocalNotifications || cap()?.PushNotifications);
 const FCM_BUILD = Boolean(window.HOMEBOARD_FCM);
 const PUSH_CHANNEL_ID = 'homeboard-tasks';
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone === true;
 
-// 'on' | 'prompt' | 'denied' | 'unsupported' | 'no-fcm' | 'error' | 'unknown'
+// 'on' | 'prompt' | 'denied' | 'unsupported' | 'ios-install' | 'no-fcm' | 'error' | 'unknown'
 let pushState = 'unknown';
+let pushError = '';
 let pushCfg = null;
 let pushListenersReady = false;
-let gestureAskArmed = false;
+let pendingOpenTaskId = null;
 
 function b64ToBytes(b64) {
   const pad = '='.repeat((4 - (b64.length % 4)) % 4);
@@ -1479,108 +1506,119 @@ async function pushConfig() {
   return pushCfg;
 }
 
+async function registerDevice(body) {
+  const out = await api('/push/subscribe', { method: 'POST', body });
+  // Sent back on every request, so adding a task for yourself on this device
+  // buzzes your other devices but not this one.
+  if (out?.id) localStorage.setItem('hb.pushDevice', out.id);
+}
+
 /** Once permission is there, reminders ride on it too unless someone turned them off. */
 async function defaultRemindersOn() {
   if (localStorage.getItem('hb.reminders') !== null) return;
-  localStorage.setItem('hb.reminders', '1');
-  await syncRemindersToggle();
-  scheduleReminders();
+  // Same path as flipping the switch, so the "may arrive late" warning about
+  // Android's exact-alarm setting still shows — just without "Reminders on."
+  await setReminders(true, { quiet: true });
 }
 
-async function enableNativePush(pn, { ask }) {
-  if (!FCM_BUILD) { pushState = 'no-fcm'; return; }
-  setupNativeListeners(pn);
+/* ── Android (APK) ── */
 
-  let perm = (await pn.checkPermissions())?.receive;
+async function nativePermission(ask) {
+  // Both plugins sit on the same Android permission (POST_NOTIFICATIONS).
+  const pn = pushNative();
+  const ln = localNotifications();
+  const plugin = pn || ln;
+  if (!plugin) return 'unsupported';
+  const key = pn ? 'receive' : 'display';
+  let perm = (await plugin.checkPermissions())?.[key];
   if ((perm === 'prompt' || perm === 'prompt-with-rationale') && ask) {
-    perm = (await pn.requestPermissions())?.receive;
+    perm = (await plugin.requestPermissions())?.[key];
   }
-  if (perm !== 'granted') { pushState = perm === 'denied' ? 'denied' : 'prompt'; return; }
+  return perm;
+}
 
-  try {
-    await pn.createChannel({
-      id: PUSH_CHANNEL_ID,
-      name: 'New tasks',
-      description: 'When someone puts a task on your plate.',
-      importance: 5,
-      visibility: 1,
-      vibration: true,
-      lights: true,
-    });
-  } catch { /* Android 7 and older have no channels */ }
+async function enableNativePush({ ask }) {
+  const perm = await nativePermission(ask);
+  if (perm !== 'granted') { pushState = perm === 'denied' ? 'denied' : 'prompt'; return; }
+  defaultRemindersOn();
+
+  // The channel new-task notifications arrive on — used by Firebase and by the
+  // in-app backstop alike, so create it whichever plugin is present.
+  const channel = {
+    id: PUSH_CHANNEL_ID,
+    name: 'New tasks',
+    description: 'When someone puts a task on your plate.',
+    importance: 5,
+    visibility: 1,
+    vibration: true,
+    lights: true,
+  };
+  const pn = pushNative();
+  try { await (pn || localNotifications())?.createChannel?.(channel); } catch { /* Android 7 and older */ }
+
+  if (!pn || !FCM_BUILD) { pushState = 'no-fcm'; return; }
+  setupNativeListeners(pn);
 
   await pn.register(); // the token arrives on the 'registration' listener
   pushState = 'on';
-  defaultRemindersOn();
 }
 
 function setupNativeListeners(pn) {
-  if (pushListenersReady) return;
+  if (pushListenersReady || !pn?.addListener) return;
   pushListenersReady = true;
 
   pn.addListener('registration', async ({ value }) => {
     try {
-      await api('/push/subscribe', { method: 'POST', body: { kind: 'fcm', token: value } });
+      await registerDevice({ kind: 'fcm', token: value });
       localStorage.setItem('hb.fcmToken', value);
     } catch (err) {
-      console.warn('[HomeBoard] could not register this phone for push', err);
+      pushState = 'error';
+      pushError = err.message;
+      updatePushUi();
     }
   });
 
   pn.addListener('registrationError', (err) => {
     console.warn('[HomeBoard] push registration failed', err);
     pushState = 'error';
+    pushError = err?.error || 'Firebase registration failed';
     updatePushUi();
   });
 
   // In the foreground Android does not draw FCM notifications, so we do.
-  pn.addListener('pushNotificationReceived', async (n) => {
+  pn.addListener('pushNotificationReceived', (n) => {
+    const d = n?.data || {};
+    if (d.taskId) markNotified(d.taskId);
     refreshNow({ silent: true });
-    const ln = localNotifications();
-    if (ln && n?.data?.kind === 'task-assigned') {
-      try {
-        await ln.schedule({
-          notifications: [{
-            id: (n.data.taskId ? taskHash(n.data.taskId) : Math.floor(Math.random() * BAND)) + BAND_SNOOZE + 1,
-            title: n.title || 'New task',
-            body: n.body || '',
-            channelId: PUSH_CHANNEL_ID,
-            smallIcon: 'ic_launcher',
-            extra: { taskId: n.data.taskId },
-          }],
-        });
-        return;
-      } catch { /* fall through to a toast */ }
-    }
-    if (n?.title) toast(`${n.title}${n.body ? ' — ' + n.body : ''}`);
+    showLocal({ id: d.taskId, title: n.title || 'New task', body: n.body || '' });
   });
 
   pn.addListener('pushNotificationActionPerformed', (a) => openTaskFromPush(a?.notification?.data?.taskId));
 }
 
+/* ── Browser ── */
+
 async function enableWebPush({ ask }) {
+  if (isIOS() && !isStandalone()) { pushState = 'ios-install'; return; }
   if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
     pushState = 'unsupported';
     return;
   }
 
-  // Ask first, before any network: browsers only show the prompt while the
-  // tap that triggered it is still fresh.
+  // The permission request must be the first thing that awaits, while the tap
+  // that led here still counts.
   let perm = Notification.permission;
-  if (perm === 'default') {
-    // Show the banner now — the prompt may be ignored and never answered.
-    pushState = 'prompt';
-    updatePushUi();
-  }
   if (perm === 'default' && ask) {
     try { perm = await Notification.requestPermission(); } catch { perm = Notification.permission; }
   }
   if (perm !== 'granted') { pushState = perm === 'denied' ? 'denied' : 'prompt'; return; }
+  defaultRemindersOn();
 
   const { webPublicKey } = await pushConfig();
-  if (!webPublicKey) { pushState = 'error'; return; }
+  if (!webPublicKey) { pushState = 'error'; pushError = 'the server has no push key'; return; }
 
-  const reg = await navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready);
+  await navigator.serviceWorker.register('/sw.js');
+  const reg = await navigator.serviceWorker.ready;
   let sub = await reg.pushManager.getSubscription();
 
   // A subscription made against an older server key can never be delivered to.
@@ -1591,51 +1629,149 @@ async function enableWebPush({ ask }) {
   if (!sub) {
     sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(webPublicKey) });
   }
-  await api('/push/subscribe', { method: 'POST', body: { kind: 'web', subscription: sub.toJSON() } });
+  await registerDevice({ kind: 'web', subscription: sub.toJSON() });
   pushState = 'on';
-  defaultRemindersOn();
 }
 
 /** Get this device ready to receive new-task notifications. Safe to call any time. */
 let pushInFlight = null;
 function enablePush(opts = {}) {
   // A tap on Allow runs at once: a browser prompt can sit unanswered for ever,
-  // and the tap must not queue behind it. Subscribing twice is harmless.
+  // and the tap must not queue behind it. Registering twice is harmless.
   if (opts.ask) return doEnablePush(opts);
   if (!pushInFlight) pushInFlight = doEnablePush(opts).finally(() => { pushInFlight = null; });
   return pushInFlight;
 }
-async function doEnablePush({ ask = true } = {}) {
+async function doEnablePush({ ask = false } = {}) {
   if (!state.user) return;
+  pushError = '';
   try {
-    const pn = pushNative();
-    if (isNativeApp() || pn) {
-      if (pn) await enableNativePush(pn, { ask });
-      else pushState = 'no-fcm';
-    } else {
-      await enableWebPush({ ask });
-    }
+    if (isNativeApp() || pushNative()) await enableNativePush({ ask });
+    else await enableWebPush({ ask });
   } catch (err) {
     console.warn('[HomeBoard] could not turn on push', err);
     pushState = 'error';
+    pushError = err?.message || String(err);
   }
   updatePushUi();
-  armGestureAsk();
+  if (pushState === 'on' && openSheet === $('#sheet-notify')) {
+    closeSheet();
+    toast('Notifications on. New tasks will reach you even with HomeBoard closed.');
+  }
 }
 
 /*
- * Browsers ignore a permission request that is not tied to a tap. If the
- * automatic ask at sign-in was swallowed, ask again on the very next tap.
+ * Straight after sign-in. On Android the system dialog appears by itself; in
+ * a browser our sheet appears, and its button asks.
  */
-function armGestureAsk() {
-  if (pushState !== 'prompt' || gestureAskArmed) return;
-  gestureAskArmed = true;
-  const once = () => {
-    document.removeEventListener('pointerup', once, true);
-    gestureAskArmed = false;
-    if (pushState === 'prompt') enablePush({ ask: true });
-  };
-  document.addEventListener('pointerup', once, true);
+async function askForNotifications() {
+  if (!state.user) return;
+  if (isNativeApp() || pushNative()) { await enablePush({ ask: true }); return; }
+  await enablePush({ ask: false }); // registers silently if already allowed
+  if (!['prompt', 'ios-install', 'denied'].includes(pushState)) return;
+  // Once per launch, and never on top of something the person has open —
+  // the banner stays up either way.
+  if (notifySheetShown) return;
+  if (openSheet) { afterSheetClosed = askForNotifications; return; } // e.g. creating a first board
+  notifySheetShown = true;
+  showNotifySheet();
+}
+let notifySheetShown = false;
+
+function showNotifySheet() {
+  const s = pushState;
+  $('#notify-title').textContent =
+    s === 'denied' ? 'Notifications are blocked' :
+    s === 'ios-install' ? 'Add HomeBoard to your Home Screen' :
+    'Turn on notifications';
+  $('#notify-text').innerHTML =
+    s === 'denied' ? denyHelp() :
+    s === 'ios-install'
+      ? 'On iPhone, notifications only work from the Home Screen app. Tap <strong>Share</strong> ' +
+        '<span aria-hidden="true">⎋</span> → <strong>Add to Home Screen</strong>, then open HomeBoard from there and sign in.'
+      : 'So you know <strong>the moment someone adds a task for you</strong> — even with HomeBoard closed. ' +
+        'Tap the button, then choose <strong>Allow</strong>.';
+  $('#notify-go').classList.toggle('hidden', s !== 'prompt');
+  sheet('#sheet-notify');
+}
+
+function denyHelp() {
+  if (isNativeApp()) return 'Open <strong>Settings → Apps → HomeBoard → Notifications</strong> and switch them on, then come back to HomeBoard.';
+  if (isStandalone()) return 'Long-press the HomeBoard icon → <strong>App info → Notifications</strong> → allow. Then reopen HomeBoard.';
+  if (/Android/.test(navigator.userAgent)) return 'In Chrome, tap the <strong>ⓘ / padlock</strong> left of the address → <strong>Permissions → Notifications → Allow</strong>. Then reload.';
+  return 'Click the <strong>padlock</strong> left of the address → <strong>Notifications → Allow</strong>. Then reload the page.';
+}
+
+/* ── Backstop: notice new tasks whenever the app is alive ── */
+
+const SEEN_KEY = 'hb.seenTasks';
+function seenTasks() {
+  try { return new Set(JSON.parse(localStorage.getItem(SEEN_KEY) || 'null') || []); } catch { return null; }
+}
+function markNotified(taskId) {
+  const seen = seenTasks() || new Set();
+  seen.add(taskId);
+  localStorage.setItem(SEEN_KEY, JSON.stringify([...seen].slice(-300)));
+}
+
+async function showLocal({ id, title, body }) {
+  if (document.visibilityState === 'visible') { toast(`${title} — ${body}`, id ? { label: 'Open', run: () => openTaskFromPush(id) } : null, 6000); return; }
+  const ln = localNotifications();
+  try {
+    if (ln) {
+      await ln.schedule({ notifications: [{
+        id: (id ? taskHash(id) : Math.floor(Math.random() * BAND)) + BAND_SNOOZE + 1,
+        title, body, channelId: PUSH_CHANNEL_ID, smallIcon: 'ic_launcher', extra: { taskId: id },
+      }] });
+      return;
+    }
+    if ('Notification' in window && Notification.permission === 'granted' && 'serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.ready;
+      await reg.showNotification(title, {
+        body, icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
+        tag: id ? `task:${id}` : undefined, data: { taskId: id }, vibrate: [200, 100, 200],
+      });
+    }
+  } catch (err) { console.warn('[HomeBoard] local notification failed', err); }
+}
+
+/** Called after every refresh. Tells you about tasks newly on your plate. */
+function noticeNewTasks() {
+  if (!state.user) return;
+  const mine = state.tasks.filter((t) => t.assigneeId === state.user.id);
+  const seen = seenTasks();
+  if (!seen) {
+    // First run on this device: everything already here is old news.
+    localStorage.setItem(SEEN_KEY, JSON.stringify(mine.map((t) => t.id)));
+    return;
+  }
+  const fresh = mine.filter((t) => !seen.has(t.id));
+  if (!fresh.length) return;
+  fresh.forEach((t) => seen.add(t.id));
+  localStorage.setItem(SEEN_KEY, JSON.stringify([...seen].slice(-300)));
+
+  // Push already told this device — don't say it twice.
+  if (pushState === 'on') return;
+  for (const t of fresh.slice(0, 5)) {
+    const self = t.createdById === state.user.id;
+    if (self && document.visibilityState === 'visible') continue;
+    const who = t.createdBy?.name?.split(/\s+/)[0] || 'Someone';
+    const board = state.projects.find((p) => p.id === t.projectId)?.name;
+    showLocal({ id: t.id, title: self ? 'New task on your plate' : `New task from ${who}`, body: `${t.title}${board ? ` — ${board}` : ''}` });
+  }
+}
+
+/* ── Opening a task from a notification ── */
+
+async function openTaskFromPush(taskId) {
+  if (!taskId) return;
+  // Tapped with the app killed: this fires before sign-in has finished.
+  if (!state.user || !state.projects.length) { pendingOpenTaskId = taskId; return; }
+  if (!state.tasks.some((t) => t.id === taskId)) { try { await loadAll(); } catch {} }
+  const task = state.tasks.find((t) => t.id === taskId);
+  if (!task) { toast('That task is no longer on the board.'); return; }
+  if (task.projectId !== state.activeId) { state.activeId = task.projectId; localStorage.setItem('hb.board', task.projectId); render(); }
+  openDetail(taskId);
 }
 
 async function disablePush() {
@@ -1654,18 +1790,13 @@ async function disablePush() {
       }
     }
   } catch { /* signing out goes ahead regardless */ }
+  localStorage.removeItem('hb.pushDevice');
+  localStorage.removeItem(SEEN_KEY);
   pushState = 'unknown';
   updatePushUi();
 }
 
-async function openTaskFromPush(taskId) {
-  if (!taskId || !state.user) return;
-  if (!state.tasks.some((t) => t.id === taskId)) { try { await loadAll(); } catch {} }
-  const task = state.tasks.find((t) => t.id === taskId);
-  if (!task) { toast('That task is no longer on the board.'); return; }
-  if (task.projectId !== state.activeId) { state.activeId = task.projectId; localStorage.setItem('hb.board', task.projectId); render(); }
-  openDetail(taskId);
-}
+/* ── UI ── */
 
 function updatePushUi() {
   const banner = $('#push-banner');
@@ -1678,44 +1809,85 @@ function updatePushUi() {
 
   const copy = {
     on: 'On — you get a notification as soon as someone puts a task on your plate, even with HomeBoard closed.',
-    prompt: 'Not on yet. Tap Allow so new tasks reach you with HomeBoard closed.',
-    denied: isNativeApp()
-      ? 'Blocked. Turn on Settings → Apps → HomeBoard → Notifications, then come back.'
-      : 'Blocked by your browser. Allow notifications for this site in the padlock menu, then reload.',
-    unsupported: /iPhone|iPad/.test(navigator.userAgent)
-      ? 'On iPhone, add HomeBoard to your Home Screen first (Share → Add to Home Screen), then open it from there.'
-      : 'This browser cannot receive notifications. Install the app, or use Chrome, Edge or Firefox.',
-    'no-fcm': 'This build of the app was made without Firebase, so it cannot receive new-task notifications. Rebuild it with the FIREBASE secret set (see README).',
-    error: 'Could not turn notifications on. Check your connection and try again.',
+    prompt: 'Not on yet. Tap Allow notifications so new tasks reach you with HomeBoard closed.',
+    denied: 'Blocked. ' + denyHelp().replace(/<[^>]+>/g, ''),
+    'ios-install': 'On iPhone: Share → Add to Home Screen, then open HomeBoard from the Home Screen and allow notifications.',
+    unsupported: 'This browser cannot receive push notifications. Use Chrome, Edge or Firefox, or install the app. You will still be told about new tasks while HomeBoard is open.',
+    'no-fcm': 'This APK was built without Firebase, so new tasks only reach you while HomeBoard is open or in the background. For notifications with the app closed, rebuild it with the GOOGLE_SERVICES_JSON secret (README §7).',
+    error: `Could not turn notifications on${pushError ? ` (${pushError})` : ''}. Tap Allow notifications to try again.`,
     unknown: 'Checking notifications…',
   };
 
   if (status) status.textContent = copy[pushState] || copy.unknown;
   allow?.classList.toggle('hidden', !(pushState === 'prompt' || pushState === 'error'));
-  test?.classList.toggle('hidden', pushState !== 'on');
+  test?.classList.toggle('hidden', !(pushState === 'on' || pushState === 'no-fcm'));
 
-  const showBanner = signedIn && (pushState === 'prompt' || pushState === 'denied');
+  const showBanner = signedIn && ['prompt', 'denied', 'error', 'ios-install'].includes(pushState);
   banner?.classList.toggle('hidden', !showBanner);
-  if (text) text.textContent = pushState === 'denied' ? copy.denied : 'So you hear about new tasks the moment they are put on your plate.';
-  bannerBtn?.classList.toggle('hidden', pushState !== 'prompt');
+  if (text) {
+    text.textContent =
+      pushState === 'denied' ? 'Notifications are blocked — tap Fix to see how to allow them.' :
+      pushState === 'ios-install' ? 'Add HomeBoard to your Home Screen to get notifications.' :
+      'So you hear about new tasks the moment they are put on your plate.';
+  }
+  if (bannerBtn) bannerBtn.textContent = pushState === 'prompt' || pushState === 'error' ? 'Allow' : 'Fix';
 }
 
-$('#push-banner-btn').addEventListener('click', () => enablePush({ ask: true }));
+async function renderPushDiagnostics() {
+  const box = $('#push-diag');
+  if (!box || !state.user) return;
+  const lines = [];
+  lines.push(`This device: ${isNativeApp() ? `Android app${FCM_BUILD ? ' (Firebase)' : ' (no Firebase)'}` : isStandalone() ? 'installed web app' : 'browser tab'}`);
+  if ('Notification' in window && !isNativeApp()) lines.push(`Browser permission: ${Notification.permission}`);
+  lines.push(`Status: ${pushState}${pushError ? ` — ${pushError}` : ''}`);
+  try {
+    const s = await api('/push/status');
+    lines.push(`Server: web push ${s.web ? 'on' : 'OFF'}, Android push ${s.fcm ? 'on' : 'OFF (no FCM_SERVICE_ACCOUNT)'}`);
+    const me = localStorage.getItem('hb.pushDevice');
+    if (!s.devices.length) lines.push('Registered devices: none');
+    for (const d of s.devices) {
+      const last = d.last ? `${d.last.ok ? 'last push delivered' : 'last push FAILED'} ${ago(d.last.at)}${d.last.ok ? '' : ` — ${d.last.detail}`}` : 'no push sent yet';
+      lines.push(`• ${d.id === me ? 'this device' : 'another device'} (${d.kind === 'fcm' ? 'Android' : d.service}) — ${last}`);
+    }
+  } catch (err) {
+    lines.push(`Server: ${err.message}`);
+  }
+  box.textContent = lines.join('\n');
+}
+
+$('#push-banner-btn').addEventListener('click', () => {
+  if (pushState === 'prompt' || pushState === 'error') enablePush({ ask: true });
+  else showNotifySheet();
+});
 $('#push-allow').addEventListener('click', () => enablePush({ ask: true }));
+$('#notify-go').addEventListener('click', () => enablePush({ ask: true }));
+$('#notify-later').addEventListener('click', () => closeSheet());
 $('#push-test').addEventListener('click', async () => {
   try {
     const out = await api('/push/test', { method: 'POST' });
-    toast(out.sent ? 'Sent — it should appear in a moment. Try it with the app closed, too.' : 'No device took it. Try Allow again.');
+    toast(out.sent ? 'Sent — it should appear in a moment. Try it with the app closed, too.' : 'No device took it — see Troubleshoot below.');
+    setTimeout(renderPushDiagnostics, 1500);
   } catch (err) { toast(err.message); }
 });
+$('#push-diag-wrap')?.addEventListener('toggle', (e) => { if (e.target.open) renderPushDiagnostics(); });
 
 // Messages from the service worker.
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (e) => {
     const msg = e.data || {};
-    if (msg.type === 'hb-push') refreshNow({ silent: true });
+    if (msg.type === 'hb-push') { if (msg.data?.taskId) markNotified(msg.data.taskId); refreshNow({ silent: true }); }
     else if (msg.type === 'hb-open-task') openTaskFromPush(msg.taskId);
     else if (msg.type === 'hb-resubscribe') enablePush({ ask: false });
+  });
+
+  // A new version of the app took over: reload once so the page runs the new
+  // code instead of the copy the old worker served from its cache.
+  const hadController = Boolean(navigator.serviceWorker.controller);
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded || openSheet) return;
+    reloaded = true;
+    location.reload();
   });
 }
 
@@ -1723,6 +1895,12 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.user && pushState !== 'on') enablePush({ ask: false });
 });
+
+// Registered at startup, not after sign-in, so a tap that cold-started the app is not missed.
+(function earlyNativeListeners() {
+  const pn = pushNative();
+  if (pn && FCM_BUILD) setupNativeListeners(pn);
+})();
 
 /* ───────────────────────── QR invites ───────────────────────── */
 
@@ -1838,15 +2016,15 @@ async function boot() {
   $('#app-screen').classList.remove('hidden');
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
   $('#my-avatar').textContent = initials(state.user.name);
-  // Straight after sign-in, before anything else: get this device ready for
-  // new-task notifications. First, so the prompt still counts as coming from
-  // the Sign in tap.
-  enablePush({ ask: true });
   await syncRemindersToggle();
   await loadAll();
+  noticeNewTasks();
   await consumePendingJoin();
   scheduleReminders();
   startPolling();
+  // Straight after sign-in: ask for notification permission.
+  askForNotifications();
+  if (pendingOpenTaskId) { const id = pendingOpenTaskId; pendingOpenTaskId = null; openTaskFromPush(id); }
   // Opened from a notification in a browser.
   const fromPush = new URLSearchParams(location.search).get('task');
   if (fromPush) {

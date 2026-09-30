@@ -1,57 +1,59 @@
-# HomeBoard — files to update
+# HomeBoard — files to update (push, round 2)
 
-**New-task push notifications.** The moment someone adds a task for you — or hands you one — your
-phone gets a notification, even with HomeBoard closed. Permission is asked for straight after
-sign-in; nobody has to find a switch.
+Fixes for new-task notifications not arriving on Android and in the browser.
+
+## What was wrong, and what changed
+
+| Problem | Fix |
+|---|---|
+| **Phone browsers never showed the prompt.** Chrome on Android blocks or silently hides a permission prompt that doesn't come from a tap, and the old code asked automatically after sign-in. | Right after sign-in a **Turn on notifications** sheet appears; its button is the tap that asks. It comes back every launch until notifications are on. If they're blocked, it says exactly where to unblock them (Chrome ⓘ → Permissions, installed app → App info, etc.). |
+| **iPhone Safari tab** can't receive web push at all. | The sheet tells iPhone users to Add to Home Screen first. |
+| **APK built without Firebase never asked for permission at all**, so nothing — not even reminders — could show. | Android's permission dialog now appears at sign-in on every APK build. |
+| **Testing with your own account did nothing** — tasks you add for yourself were never pushed. | Adding a task for yourself now buzzes your *other* devices (never the one you used). |
+| **After the update, the old app code kept running** from the offline cache until a second reload. | The page reloads itself once when the new version takes over. |
+| **No way to see why a push didn't arrive.** | Account → *Troubleshoot notifications* lists each device and the last delivery result, with the push service's error if it failed. `/api/push/status` returns the same. |
+| **Tapping a notification that launched the APK** didn't open the task. | The tap is kept until sign-in finishes, then opens the task. |
+| Apple's push service rejects the placeholder VAPID contact. | Uses your Render URL automatically (`RENDER_EXTERNAL_URL`). |
+| No alert at all on a device that couldn't register for push. | **Backstop:** while HomeBoard is open or in the background, a task newly on your plate raises a notification on the device itself. |
+
+## Important for the APK
+
+Notifications **with the app fully closed** on Android can only come through Firebase — there is no
+other way to wake a closed Android app instantly. If you haven't yet, do the one-off setup in
+**README §7** (`GOOGLE_SERVICES_JSON` secret in GitHub + `FCM_SERVICE_ACCOUNT` on Render), then
+rebuild and reinstall. Without it, Account → New tasks says *"built without Firebase"*, and new
+tasks only reach the phone while HomeBoard is open or in the background.
 
 ## Copy these into your repo
 
 ```
-server/push.js                      (new) Web Push + Firebase sender, device list
-server/routes/push.js               (new) /api/push/config · subscribe · unsubscribe · test
-server/index.js                     mounts the routes, starts push, health shows push status
-server/store.js                     adds the push.json collection
-server/routes/tasks.js              pushes on new task and on reassign
-server/routes/auth.js               deleting an account removes its devices
-public/app.js                       asks on sign-in, registers the device, banner, tap-to-open
-public/sw.js                        shows pushes with the app closed; opens the task on tap
-public/index.html                   the banner and Account → New tasks
-package.json                        web-push; @capacitor/push-notifications; test:push
-render.yaml                         FCM_SERVICE_ACCOUNT
-.github/workflows/android.yml       writes google-services.json from a secret
-scripts/patch-android-manifest.js   checks the push plugin, FCM channel, Firebase file
-scripts/setup-android.sh            GOOGLE_SERVICES_JSON for local builds
-scripts/push-test.js                (new) 40 assertions, server side
-scripts/push-ui-test.js             (new) 16 assertions in real Chromium
-README.md                           section 7, API table
+public/app.js                 permission sheet, native ask, backstop, diagnostics, reload-on-update
+public/index.html             the Turn on notifications sheet, Troubleshoot panel
+public/sw.js                  version bump so phones pick the new code up
+server/push.js                self-assign → other devices, delivery log, VAPID subject
+server/routes/push.js         GET /api/push/status
+server/routes/tasks.js        passes the originating device
+server/index.js               allows the X-HB-Device header from the APK
+scripts/push-test.js          36 assertions (45 with HB_TEST_FCM=1)
+scripts/push-ui-test.js       21 — phone browser, blocked, iPhone, backstop, closed-page push
+scripts/push-android-test.js  (new) 17 — APK with and without Firebase, cold-start tap
+scripts/ui-test.js            answers "Not now" to the new sheet
+scripts/reminders-test.js     reminders are now on by default once allowed
+README.md                     §7 updated
+CHANGED.md
 ```
 
-## After copying
+If you didn't apply round 1, use the full zip instead.
 
-1. `git add -A && git commit -m "Push a notification when a task is added" && git push`
-   — Render redeploys. **Browsers and the installed PWA work immediately**; no keys to set.
-2. **For the APK**, do the one-off Firebase setup in README §7 (a `GOOGLE_SERVICES_JSON` repo
-   secret, and `FCM_SERVICE_ACCOUNT` on Render), then rebuild the APK and reinstall.
-3. Check `/api/health` → `"push":{"web":true,"fcm":true}`.
+Then: commit and push → Render redeploys. For Android, re-run **Build Android APK** and reinstall.
 
-## What happens
+## Check it works
 
-- Alice adds *Take the bins out* for Bob → within a second Bob's phone shows
-  **New task from Alice — Take the bins out — Home**. Tapping it opens that task.
-- Reassigning a task to someone sends **Alice handed you a task**.
-- Adding a task for yourself, or editing one without reassigning, sends nothing.
-- Signing out stops pushes to that device; deleting the account removes all of them. Devices
-  the push service reports as gone (app uninstalled, browser data cleared) are pruned.
-- A push never slows down or fails the request that created the task.
-
-## About "override the permission"
-
-The app now asks by itself the moment you sign in, keeps a banner up until it's answered, and asks
-again on the next tap if the first prompt was ignored. What it cannot do — no app can — is tick
-*Allow* on the person's behalf: Android 13+ and every browser require that one tap. On Android 12
-and older there is no prompt at all; notifications are on from install.
+1. On the phone, open HomeBoard, sign in → tap **Turn on notifications → Allow**
+   (APK: tap **Allow** on Android's dialog).
+2. Account → **Send me a test**. Close the app, and try again from another device.
+3. If nothing arrives: Account → **Troubleshoot notifications** shows which step failed.
 
 ## Tests
 
-All green: smoke 46 · store 9 · qr 10 · reminders 39 · ui 42 · push 31 (+9 with `HB_TEST_FCM=1`)
-· push-ui 16.
+All green: smoke 46 · store 9 · qr 10 · reminders 38 · ui 42 · push 36 (+9 FCM) · push-ui 21 · push-android 17.

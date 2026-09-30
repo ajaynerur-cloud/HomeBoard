@@ -5,6 +5,17 @@
  */
 const { chromium } = require('playwright');
 const BASE = process.argv[2] || 'http://localhost:3000';
+
+// The "Turn on notifications" sheet appears after sign-in in a browser; these
+// flows aren't about that, so it is answered "Not now" whenever it shows.
+const AUTO_NOT_NOW = `
+  document.addEventListener('DOMContentLoaded', () => {
+    new MutationObserver(() => {
+      if (document.querySelector('#sheet-notify.open')) document.querySelector('#notify-later')?.click();
+    }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+  });
+`;
+
 let pass=0, fail=0;
 const ok=(l)=>{pass++;console.log(`  \x1b[32m✓\x1b[0m ${l}`)};
 const bad=(l,d)=>{fail++;console.log(`  \x1b[31m✗\x1b[0m ${l} — ${d||''}`)};
@@ -17,6 +28,7 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
     process.env.PLAYWRIGHT_CHROME ? { executablePath: process.env.PLAYWRIGHT_CHROME } : {}
   );
   const ctx=await b.newContext({viewport:{width:430,height:932}});
+  await ctx.addInitScript(AUTO_NOT_NOW);
   const p=await ctx.newPage();
   const errs=[];
   p.on('pageerror',e=>errs.push('pageerror: '+e.message));
@@ -123,7 +135,8 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   const qrModules = await p.locator('#invite-qr svg path').getAttribute('d');
   check('the QR has real content', (qrModules || '').length > 400, `path length ${(qrModules || '').length}`);
 
-  const p2 = await (await b.newContext({viewport:{width:430,height:932}})).newPage();
+  const ctx2 = await b.newContext({viewport:{width:430,height:932}}); await ctx2.addInitScript(AUTO_NOT_NOW);
+  const p2 = await ctx2.newPage();
   p2.on('pageerror',e=>errs.push('p2 pageerror: '+e.message));
   await p2.goto(BASE);
   await p2.click('#tab-signup');
@@ -173,7 +186,7 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   check('a task added by someone else appears without a reload', true);
 
   // Explicit refresh button
-  await p.click('#refresh-btn');
+    await p.click('#refresh-btn');
   await p.waitForTimeout(1200);
   check('the refresh button works', await p.locator('.task').count() >= 1);
 
@@ -210,7 +223,8 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
 
   // Scanning the QR opens a ?join= link. New person: sign up, land on the board.
   await p.keyboard.press('Escape');
-  const p3 = await (await b.newContext({ viewport: { width: 430, height: 932 } })).newPage();
+  const ctx3 = await b.newContext({ viewport: { width: 430, height: 932 } }); await ctx3.addInitScript(AUTO_NOT_NOW);
+  const p3 = await ctx3.newPage();
   p3.on('pageerror', (e) => errs.push('p3 pageerror: ' + e.message));
   await p3.goto(`${BASE}/?join=${code.trim()}`);
   await p3.waitForTimeout(800);

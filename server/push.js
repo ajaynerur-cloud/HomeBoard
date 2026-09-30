@@ -55,7 +55,13 @@ async function initVapid() {
     }
   }
 
-  const subject = process.env.VAPID_SUBJECT || 'mailto:homeboard@example.com';
+  // Apple's push service rejects a made-up subject, so prefer the app's real
+  // URL — Render sets RENDER_EXTERNAL_URL on every service automatically.
+  const subject =
+    process.env.VAPID_SUBJECT ||
+    (/^https:\/\//.test(process.env.RENDER_EXTERNAL_URL || '') ? process.env.RENDER_EXTERNAL_URL : '') ||
+    (/^https:\/\//.test(process.env.APP_URL || '') ? process.env.APP_URL : '') ||
+    'mailto:homeboard@users.noreply.github.com';
   webpush.setVapidDetails(subject, publicKey, privateKey);
   vapid = { publicKey };
 }
@@ -209,14 +215,38 @@ const removeUser = (userId) => removeDevices((r) => r.userId === userId, 'HomeBo
 
 /* ───────────── sending ───────────── */
 
+/*
+ * The last delivery result per device, in memory only — so "why didn't my phone
+ * buzz?" has an answer in Account without a commit to the data repo per push.
+ */
+const lastResult = new Map();
+const note = (id, ok, detail = '') => lastResult.set(id, { at: new Date().toISOString(), ok, detail: String(detail).slice(0, 200) });
+
+async function status(userId) {
+  const devices = (await store.read(COLLECTION)).filter((r) => r.type === 'device' && r.userId === userId);
+  return {
+    web: Boolean(vapid?.publicKey),
+    fcm: Boolean(serviceAccount),
+    devices: devices.map((d) => ({
+      id: d.id,
+      kind: d.kind,
+      service: d.kind === 'web' ? new URL(d.subscription.endpoint).host : 'fcm.googleapis.com',
+      createdAt: d.createdAt,
+      last: lastResult.get(d.id) || null,
+    })),
+  };
+}
+
 /**
  * Send one notification to every device a user has. Never throws.
  * Resolves to { sent, failed, pruned } — handy for tests and logs.
  */
-async function sendToUser(userId, msg) {
-  const out = { sent: 0, failed: 0, pruned: 0 };
+async function sendToUser(userId, msg, { exceptDevice = null } = {}) {
+  const out = { sent: 0, failed: 0, pruned: 0, skipped: 0 };
   try {
-    const devices = (await store.read(COLLECTION)).filter((r) => r.type === 'device' && r.userId === userId);
+    const all = (await store.read(COLLECTION)).filter((r) => r.type === 'device' && r.userId === userId);
+    const devices = all.filter((d) => d.id !== exceptDevice);
+    out.skipped = all.length - devices.length;
     const dead = new Set();
 
     await Promise.all(devices.map(async (d) => {
@@ -224,16 +254,21 @@ async function sendToUser(userId, msg) {
         if (d.kind === 'web') {
           await webpush.sendNotification(d.subscription, JSON.stringify(msg), { TTL: 24 * 60 * 60, urgency: 'high', topic: msg.data?.taskId?.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32) || undefined });
           out.sent++;
+          note(d.id, true, 'delivered to push service');
         } else if (d.kind === 'fcm') {
-          if (!serviceAccount) { out.failed++; return; }
+          if (!serviceAccount) { out.failed++; note(d.id, false, 'server has no FCM_SERVICE_ACCOUNT'); return; }
           const r = await sendFcm(d.token, msg);
-          if (r === 'ok') out.sent++;
+          if (r === 'ok') { out.sent++; note(d.id, true, 'delivered to Firebase'); }
           else if (r === 'gone') dead.add(d.id);
-          else out.failed++;
+          else { out.failed++; note(d.id, false, 'Firebase refused it — see server log'); }
         }
       } catch (err) {
         if (err.statusCode === 404 || err.statusCode === 410) dead.add(d.id);
-        else { out.failed++; console.warn('[HomeBoard] push failed:', err.statusCode || '', err.body || err.message); }
+        else {
+          out.failed++;
+          note(d.id, false, `${err.statusCode || ''} ${err.body || err.message}`.trim());
+          console.warn('[HomeBoard] push failed:', err.statusCode || '', err.body || err.message);
+        }
       }
     }));
 
@@ -247,12 +282,19 @@ async function sendToUser(userId, msg) {
   return out;
 }
 
-/** "Alice put a task on your plate." Skips people assigning to themselves. */
-function notifyAssigned(task, { byUser, projectName, reassigned = false } = {}) {
-  if (!task?.assigneeId || task.assigneeId === byUser?.id) return Promise.resolve(null);
+/**
+ * "Alice put a task on your plate."
+ *
+ * Adding a task for yourself still reaches your OTHER devices — add it on the
+ * laptop, the phone buzzes — but never the device you added it from.
+ */
+function notifyAssigned(task, { byUser, projectName, reassigned = false, fromDevice = null } = {}) {
+  if (!task?.assigneeId) return Promise.resolve(null);
+  const self = task.assigneeId === byUser?.id;
   const who = byUser?.name?.split(/\s+/)[0] || 'Someone';
+  const title = self ? 'New task on your plate' : reassigned ? `${who} handed you a task` : `New task from ${who}`;
   return sendToUser(task.assigneeId, {
-    title: reassigned ? `${who} handed you a task` : `New task from ${who}`,
+    title,
     body: `${task.title}${projectName ? ` — ${projectName}` : ''}`,
     data: {
       kind: 'task-assigned',
@@ -261,7 +303,7 @@ function notifyAssigned(task, { byUser, projectName, reassigned = false } = {}) 
       dueAt: task.dueAt || '',
       priority: task.priority || 'normal',
     },
-  });
+  }, { exceptDevice: self ? fromDevice : null });
 }
 
 async function init() {
@@ -271,4 +313,4 @@ async function init() {
 
 const config = () => ({ webPublicKey: vapid?.publicKey || null, fcm: Boolean(serviceAccount), channelId: CHANNEL_ID });
 
-module.exports = { init, config, addDevice, removeDevice, removeUser, sendToUser, notifyAssigned, COLLECTION, CHANNEL_ID };
+module.exports = { init, config, status, addDevice, removeDevice, removeUser, sendToUser, notifyAssigned, COLLECTION, CHANNEL_ID };

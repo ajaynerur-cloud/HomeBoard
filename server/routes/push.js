@@ -27,6 +27,11 @@ router.post('/unsubscribe', requireAuth, async (req, res, next) => {
   }
 });
 
+/** What this account's devices look like to the server, and how the last push to each went. */
+router.get('/status', requireAuth, async (req, res, next) => {
+  try { res.json(await push.status(req.user.id)); } catch (err) { next(err); }
+});
+
 /** Send yourself a test notification — lets people check it works with the app closed. */
 router.post('/test', requireAuth, async (req, res, next) => {
   try {
