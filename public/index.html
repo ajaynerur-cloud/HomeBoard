@@ -97,6 +97,11 @@
       <button class="btn btn-primary btn-sm" id="install-btn">Install</button>
       <button class="btn btn-ghost btn-sm" id="install-dismiss" aria-label="Dismiss">✕</button>
     </div>
+    <div id="push-banner" class="install hidden" role="status">
+      <img src="/icons/icon-192.png" alt="" width="34" height="34" style="border-radius:9px">
+      <p><strong>Turn on notifications</strong><br><span id="push-banner-text">So you hear about new tasks the moment they are put on your plate.</span></p>
+      <button class="btn btn-primary btn-sm" id="push-banner-btn">Allow</button>
+    </div>
     <div id="view"><div class="center-load"><span class="spinner"></span></div></div>
   </main>
 
@@ -273,6 +278,14 @@
         <button type="button" data-v="" aria-pressed="true">System</button>
         <button type="button" data-v="light" aria-pressed="false">Light</button>
         <button type="button" data-v="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>
+    <div class="detail-block">
+      <h4>New tasks</h4>
+      <p class="hint" id="push-status" style="margin:0 0 10px">Checking notifications…</p>
+      <div style="display:flex;gap:9px;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary btn-sm hidden" id="push-allow">Allow notifications</button>
+        <button type="button" class="btn btn-sm hidden" id="push-test">Send me a test</button>
       </div>
     </div>
     <div class="detail-block">

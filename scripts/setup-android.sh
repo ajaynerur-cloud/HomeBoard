@@ -63,6 +63,17 @@ npm install --no-audit --no-fund
 echo "==> Creating the android/ project"
 [ -d android ] || npx cap add android
 
+# New-task push notifications need Firebase. Point GOOGLE_SERVICES_JSON at
+# the google-services.json Firebase gave you:
+#   GOOGLE_SERVICES_JSON=~/Downloads/google-services.json ./scripts/setup-android.sh https://...
+if [ -n "${GOOGLE_SERVICES_JSON:-}" ]; then
+  echo "==> Adding Firebase config for push notifications"
+  cp "$GOOGLE_SERVICES_JSON" android/app/google-services.json
+  echo 'window.HOMEBOARD_FCM = true;' >> public/config.js
+else
+  echo "!! GOOGLE_SERVICES_JSON not set — this build will not receive new-task push notifications."
+fi
+
 echo "==> Generating launcher icons and splash screens"
 npx @capacitor/assets generate --android --assetPath resources
 

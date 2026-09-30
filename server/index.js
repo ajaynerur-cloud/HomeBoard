@@ -7,6 +7,7 @@ const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 
 const store = require('./store');
+const push = require('./push');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -52,12 +53,18 @@ app.use((req, res, next) => {
 app.use('/api', rateLimit({ windowMs: 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false }));
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, app: 'HomeBoard', storage: store.MODE, time: new Date().toISOString() });
+  const p = push.config();
+  res.json({
+    ok: true, app: 'HomeBoard', storage: store.MODE,
+    push: { web: Boolean(p.webPublicKey), fcm: p.fcm },
+    time: new Date().toISOString(),
+  });
 });
 
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/projects', require('./routes/projects'));
 app.use('/api/tasks', require('./routes/tasks'));
+app.use('/api/push', require('./routes/push'));
 
 // Static front-end. The service worker must never be cached or updates stick.
 app.use(
@@ -86,13 +93,17 @@ app.use((err, req, res, _next) => {
 
 store
   .init()
-  .then((info) => {
+  .then(async (info) => {
+    const pushInfo = await push.init();
     app.listen(PORT, () => {
       console.log(`HomeBoard listening on :${PORT}`);
       console.log(
         info.mode === 'github'
           ? `  storage: GitHub repo ${info.repo} (branch ${info.branch}, folder ${info.dir}/)`
           : `  storage: local files in ${info.repo}  — set GITHUB_TOKEN + DATA_REPO to use the private repo`
+      );
+      console.log(
+        `  push: web on${pushInfo.fcm ? ', Android (FCM) on' : ' — Android (FCM) off: set FCM_SERVICE_ACCOUNT to push to the APK'}`
       );
     });
   })

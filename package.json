@@ -1,7 +1,7 @@
 {
   "name": "homeboard",
   "version": "1.0.0",
-  "description": "HomeBoard \u2014 push to-do actions to the people you live with. Shared household task board with live countdowns.",
+  "description": "HomeBoard — push to-do actions to the people you live with. Shared household task board with live countdowns.",
   "main": "server/index.js",
   "type": "commonjs",
   "engines": {
@@ -17,7 +17,8 @@
     "test:ui": "node scripts/ui-test.js",
     "test:android": "node scripts/android-sim.js",
     "test:qr": "node scripts/qr-test.js",
-    "test:reminders": "node scripts/reminders-test.js"
+    "test:reminders": "node scripts/reminders-test.js",
+    "test:push": "node scripts/push-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -25,7 +26,8 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "web-push": "^3.6.7"
   },
   "license": "MIT",
   "devDependencies": {
@@ -34,6 +36,7 @@
     "@capacitor/assets": "^3.0.5",
     "@capacitor/cli": "^6.2.0",
     "@capacitor/core": "^6.2.0",
-    "@capacitor/local-notifications": "^6.1.0"
+    "@capacitor/local-notifications": "^6.1.0",
+    "@capacitor/push-notifications": "^6.0.5"
   }
 }

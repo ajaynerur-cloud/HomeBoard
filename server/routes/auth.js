@@ -6,6 +6,7 @@ const {
   bcrypt, newId, normaliseEmail, signToken, setAuthCookie,
   clearAuthCookie, requireAuth, publicUser, pickColor,
 } = require('../auth');
+const push = require('../push');
 
 const router = express.Router();
 
@@ -142,6 +143,8 @@ router.delete('/me', requireAuth, async (req, res, next) => {
         if (soleBoards.includes(rows[i].projectId)) rows.splice(i, 1);
       }
     }, 'HomeBoard: account deleted — history cleared');
+
+    await push.removeUser(me);
 
     await store.update('users', (rows) => {
       const i = rows.findIndex((u) => u.id === me);

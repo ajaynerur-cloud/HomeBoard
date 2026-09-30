@@ -1,74 +1,57 @@
 # HomeBoard — files to update
 
-Reminders now warn you **before** a task is due, not only as it passes, and every reminder
-carries a **Snooze 10 min** button.
+**New-task push notifications.** The moment someone adds a task for you — or hands you one — your
+phone gets a notification, even with HomeBoard closed. Permission is asked for straight after
+sign-in; nobody has to find a switch.
 
 ## Copy these into your repo
 
 ```
-public/app.js               scheduling, snooze, lead time, notification channel
-public/index.html           the lead-time control and the background-apps help
-public/app.css              styles for those
-scripts/reminders-test.js   39 assertions covering all of it
-README.md                   documentation
+server/push.js                      (new) Web Push + Firebase sender, device list
+server/routes/push.js               (new) /api/push/config · subscribe · unsubscribe · test
+server/index.js                     mounts the routes, starts push, health shows push status
+server/store.js                     adds the push.json collection
+server/routes/tasks.js              pushes on new task and on reassign
+server/routes/auth.js               deleting an account removes its devices
+public/app.js                       asks on sign-in, registers the device, banner, tap-to-open
+public/sw.js                        shows pushes with the app closed; opens the task on tap
+public/index.html                   the banner and Account → New tasks
+package.json                        web-push; @capacitor/push-notifications; test:push
+render.yaml                         FCM_SERVICE_ACCOUNT
+.github/workflows/android.yml       writes google-services.json from a secret
+scripts/patch-android-manifest.js   checks the push plugin, FCM channel, Firebase file
+scripts/setup-android.sh            GOOGLE_SERVICES_JSON for local builds
+scripts/push-test.js                (new) 40 assertions, server side
+scripts/push-ui-test.js             (new) 16 assertions in real Chromium
+README.md                           section 7, API table
 ```
 
-Keep the paths exactly as they are in this folder.
+## After copying
 
-```bash
-cd /path/to/your/homeboard
-cp -r /path/to/homeboard-update/public   .
-cp -r /path/to/homeboard-update/scripts  .
-cp    /path/to/homeboard-update/README.md .
+1. `git add -A && git commit -m "Push a notification when a task is added" && git push`
+   — Render redeploys. **Browsers and the installed PWA work immediately**; no keys to set.
+2. **For the APK**, do the one-off Firebase setup in README §7 (a `GOOGLE_SERVICES_JSON` repo
+   secret, and `FCM_SERVICE_ACCOUNT` on Render), then rebuild the APK and reinstall.
+3. Check `/api/health` → `"push":{"web":true,"fcm":true}`.
 
-git add public/app.js public/index.html public/app.css scripts/reminders-test.js README.md
-git commit -m "Reminders: warn before the deadline, add snooze"
-git push
-```
+## What happens
 
-Nothing changed on the server, so Render redeploying is enough for the web version. For Android,
-**rebuild the APK** — the reminder logic lives in the bundled web assets.
+- Alice adds *Take the bins out* for Bob → within a second Bob's phone shows
+  **New task from Alice — Take the bins out — Home**. Tapping it opens that task.
+- Reassigning a task to someone sends **Alice handed you a task**.
+- Adding a task for yourself, or editing one without reassigning, sends nothing.
+- Signing out stops pushes to that device; deleting the account removes all of them. Devices
+  the push service reports as gone (app uninstalled, browser data cleared) are pruned.
+- A push never slows down or fails the request that created the task.
 
-## If you did not apply the previous update
+## About "override the permission"
 
-The last one fixed the greyed-out "Allow notifications" switch. If you skipped it, these files are
-not enough on their own — use the full zip instead. That update touched:
+The app now asks by itself the moment you sign in, keeps a banner up until it's answered, and asks
+again on the next tap if the first prompt was ignored. What it cannot do — no app can — is tick
+*Allow* on the person's behalf: Android 13+ and every browser require that one tap. On Android 12
+and older there is no prompt at all; notifications are on from install.
 
-```
-package.json                Capacitor packages moved into devDependencies
-render.yaml                 npm install --omit=dev
-.github/workflows/android.yml
-scripts/setup-android.sh
-scripts/patch-android-manifest.js   (new)
-public/app.js
-scripts/reminders-test.js   (new)
-README.md
-```
+## Tests
 
-Quick check: if `package.json` has a `devDependencies` block listing `@capacitor/...`, you are
-up to date and the five files above are all you need.
-
-## What changed
-
-**Two reminders per task.** One at a chosen lead time before the deadline — 10 minutes by default,
-settable to 5, 15, 30, 60 or off — and one at the due time. A task due at 21:30 warns you at 21:20,
-then again at 21:30.
-
-**Snooze.** Both reminders carry a *Snooze 10 min* button. Snoozed reminders live in their own id
-range so the app's twenty-second refresh cannot cancel them, which it otherwise would.
-
-**They fire with the app closed.** These are alarms registered with Android, delivered by a
-broadcast receiver that does not need the app running. Swiping HomeBoard out of recents does not
-stop them, and they survive a reboot. They now go out on a dedicated max-importance channel, so
-they arrive as a heads-up with sound rather than sliding silently into the shade.
-
-**Phones that kill background apps** — Realme, Oppo, Xiaomi, Samsung, OnePlus — will still hold
-alarms back, and no app-side code can override that. Settings now has a
-*Reminders not arriving when the app is closed?* section with the exact steps.
-
-## A bug this round caught
-
-`leadMinutes()` read the saved setting with `Number(localStorage.getItem(...))`. For an unset value
-that is `Number(null)`, which is **0**, not `NaN` — so the default of 10 minutes never applied and
-the early warning was never scheduled for anyone who had not changed the setting. Fixed, and
-covered by a test.
+All green: smoke 46 · store 9 · qr 10 · reminders 39 · ui 42 · push 31 (+9 with `HB_TEST_FCM=1`)
+· push-ui 16.

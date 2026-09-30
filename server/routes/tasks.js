@@ -2,6 +2,7 @@
 const express = require('express');
 const store = require('../store');
 const { newId, requireAuth, publicUser } = require('../auth');
+const push = require('../push');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -95,6 +96,10 @@ router.post('/', async (req, res, next) => {
     };
 
     await store.update('tasks', (rows) => { rows.push(task); }, `HomeBoard: new task "${task.title}"`);
+
+    // Tell the person it was pushed to, straight away. Not awaited: a slow push
+    // service must never hold up the person creating the task.
+    push.notifyAssigned(task, { byUser: req.user, projectName: project.name });
     const [decorated] = await decorate([task]);
     res.status(201).json({ task: decorated });
   } catch (err) {
@@ -134,6 +139,12 @@ router.patch('/:id', async (req, res, next) => {
     }, `HomeBoard: update task`);
 
     if (out.error) return res.status(out.code).json({ error: out.error });
+
+    // Handed to someone new — that is a new task on their plate.
+    if (out.task.assigneeId && out.task.assigneeId !== existing.assigneeId) {
+      push.notifyAssigned(out.task, { byUser: req.user, projectName: project.name, reassigned: true });
+    }
+
     const [decorated] = await decorate([out.task]);
     res.json({ task: decorated });
   } catch (err) {

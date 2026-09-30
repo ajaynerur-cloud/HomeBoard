@@ -25,7 +25,9 @@ const EXTRA = [
   ['android.permission.VIBRATE', 'the reminder buzzing'],
 ];
 
-const REQUIRED_PLUGINS = ['@capacitor/local-notifications', '@capacitor/app'];
+const REQUIRED_PLUGINS = ['@capacitor/local-notifications', '@capacitor/app', '@capacitor/push-notifications'];
+const GOOGLE_SERVICES = path.join(ROOT, 'app', 'google-services.json');
+const PUSH_CHANNEL_ID = 'homeboard-tasks';
 
 function fail(msg) {
   console.error(`\n!! ${msg}\n`);
@@ -70,7 +72,39 @@ for (const [perm, why] of EXTRA) {
 
 if (!xml.includes('android.permission.INTERNET')) fail('The manifest has no INTERNET permission — something is very wrong.');
 
+/*
+ * New-task notifications arrive through Firebase while the app is closed, and
+ * Android draws them without running any of our code. Point Firebase at our
+ * max-importance channel so they arrive as a heads-up with sound.
+ */
+const FCM_META = 'com.google.firebase.messaging.default_notification_channel_id';
+if (!xml.includes(FCM_META)) {
+  xml = xml.replace(
+    /(<application[^>]*>)/,
+    `$1\n        <meta-data android:name="${FCM_META}" android:value="${PUSH_CHANNEL_ID}" />`
+  );
+  added.push('FCM default channel');
+}
+
 fs.writeFileSync(MANIFEST, xml);
+
+if (fs.existsSync(GOOGLE_SERVICES)) {
+  try {
+    const gs = JSON.parse(fs.readFileSync(GOOGLE_SERVICES, 'utf8'));
+    const pkgs = (gs.client || []).map((c) => c.client_info?.android_client_info?.package_name);
+    const appId = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'capacitor.config.json'), 'utf8')).appId;
+    if (!pkgs.includes(appId)) {
+      fail(`google-services.json is for ${pkgs.join(', ') || 'no app'}, not ${appId}.\n   In Firebase, add an Android app with package name ${appId} and download its google-services.json.`);
+    }
+    console.log(`Firebase: google-services.json present for ${appId} — new-task push notifications ON.`);
+  } catch (err) {
+    if (err instanceof SyntaxError) fail('android/app/google-services.json is not valid JSON.');
+    throw err;
+  }
+} else {
+  console.log('Firebase: no google-services.json — this APK will NOT receive new-task push notifications.');
+  console.log('          Add the GOOGLE_SERVICES_JSON secret (see README) and rebuild.');
+}
 console.log(added.length ? `Added: ${added.map((p) => p.split('.').pop()).join(', ')}` : 'Permissions already present.');
 
 const finalPerms = [...xml.matchAll(/uses-permission android:name="([^"]+)"/g)].map((m) => m[1].split('.').pop());

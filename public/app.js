@@ -952,6 +952,7 @@ $('#theme-seg').addEventListener('click', (e) => {
 
 $('#open-account').addEventListener('click', () => {
   syncRemindersToggle();
+  updatePushUi();
   const av = $('#acct-avatar');
   av.style.background = state.user.avatarColor || '#0f766e';
   av.textContent = initials(state.user.name);
@@ -961,6 +962,7 @@ $('#open-account').addEventListener('click', () => {
 });
 
 $('#signout-btn').addEventListener('click', async () => {
+  await disablePush();
   try { await api('/auth/signout', { method: 'POST' }); } catch { /* sign out locally anyway */ }
   setToken(null);
   state.user = null;
@@ -1436,6 +1438,292 @@ function updateLeadHint() {
     `Both carry a <strong>Snooze ${SNOOZE_MINUTES} min</strong> button.`;
 }
 
+/* ───────────────────────── push: new tasks ───────────────────────── */
+
+/*
+ * A reminder is something the phone can schedule by itself. A task someone has
+ * just put on your plate is not — the server has to tell the phone. So:
+ *
+ *   APK      Firebase Cloud Messaging via @capacitor/push-notifications. Android
+ *            draws the notification itself, so it arrives with HomeBoard
+ *            closed, swiped away, or not opened since the phone restarted.
+ *   Browser  Web Push. The browser wakes our service worker to show it, so no
+ *            HomeBoard tab has to be open.
+ *
+ * Permission is asked for straight after sign-in — nobody has to find a switch
+ * first. Browsers and Android still insist the person taps "Allow" once; no
+ * app can skip that. If the first ask is ignored, the next tap anywhere in the
+ * app asks again, and a banner stays up until it is answered.
+ */
+const pushNative = () => cap()?.PushNotifications || null;
+const isNativeApp = () => Boolean(window.Capacitor?.isNativePlatform?.());
+const FCM_BUILD = Boolean(window.HOMEBOARD_FCM);
+const PUSH_CHANNEL_ID = 'homeboard-tasks';
+
+// 'on' | 'prompt' | 'denied' | 'unsupported' | 'no-fcm' | 'error' | 'unknown'
+let pushState = 'unknown';
+let pushCfg = null;
+let pushListenersReady = false;
+let gestureAskArmed = false;
+
+function b64ToBytes(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+const bytesToB64 = (buf) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function pushConfig() {
+  if (!pushCfg) pushCfg = await api('/push/config');
+  return pushCfg;
+}
+
+/** Once permission is there, reminders ride on it too unless someone turned them off. */
+async function defaultRemindersOn() {
+  if (localStorage.getItem('hb.reminders') !== null) return;
+  localStorage.setItem('hb.reminders', '1');
+  await syncRemindersToggle();
+  scheduleReminders();
+}
+
+async function enableNativePush(pn, { ask }) {
+  if (!FCM_BUILD) { pushState = 'no-fcm'; return; }
+  setupNativeListeners(pn);
+
+  let perm = (await pn.checkPermissions())?.receive;
+  if ((perm === 'prompt' || perm === 'prompt-with-rationale') && ask) {
+    perm = (await pn.requestPermissions())?.receive;
+  }
+  if (perm !== 'granted') { pushState = perm === 'denied' ? 'denied' : 'prompt'; return; }
+
+  try {
+    await pn.createChannel({
+      id: PUSH_CHANNEL_ID,
+      name: 'New tasks',
+      description: 'When someone puts a task on your plate.',
+      importance: 5,
+      visibility: 1,
+      vibration: true,
+      lights: true,
+    });
+  } catch { /* Android 7 and older have no channels */ }
+
+  await pn.register(); // the token arrives on the 'registration' listener
+  pushState = 'on';
+  defaultRemindersOn();
+}
+
+function setupNativeListeners(pn) {
+  if (pushListenersReady) return;
+  pushListenersReady = true;
+
+  pn.addListener('registration', async ({ value }) => {
+    try {
+      await api('/push/subscribe', { method: 'POST', body: { kind: 'fcm', token: value } });
+      localStorage.setItem('hb.fcmToken', value);
+    } catch (err) {
+      console.warn('[HomeBoard] could not register this phone for push', err);
+    }
+  });
+
+  pn.addListener('registrationError', (err) => {
+    console.warn('[HomeBoard] push registration failed', err);
+    pushState = 'error';
+    updatePushUi();
+  });
+
+  // In the foreground Android does not draw FCM notifications, so we do.
+  pn.addListener('pushNotificationReceived', async (n) => {
+    refreshNow({ silent: true });
+    const ln = localNotifications();
+    if (ln && n?.data?.kind === 'task-assigned') {
+      try {
+        await ln.schedule({
+          notifications: [{
+            id: (n.data.taskId ? taskHash(n.data.taskId) : Math.floor(Math.random() * BAND)) + BAND_SNOOZE + 1,
+            title: n.title || 'New task',
+            body: n.body || '',
+            channelId: PUSH_CHANNEL_ID,
+            smallIcon: 'ic_launcher',
+            extra: { taskId: n.data.taskId },
+          }],
+        });
+        return;
+      } catch { /* fall through to a toast */ }
+    }
+    if (n?.title) toast(`${n.title}${n.body ? ' — ' + n.body : ''}`);
+  });
+
+  pn.addListener('pushNotificationActionPerformed', (a) => openTaskFromPush(a?.notification?.data?.taskId));
+}
+
+async function enableWebPush({ ask }) {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    pushState = 'unsupported';
+    return;
+  }
+
+  // Ask first, before any network: browsers only show the prompt while the
+  // tap that triggered it is still fresh.
+  let perm = Notification.permission;
+  if (perm === 'default') {
+    // Show the banner now — the prompt may be ignored and never answered.
+    pushState = 'prompt';
+    updatePushUi();
+  }
+  if (perm === 'default' && ask) {
+    try { perm = await Notification.requestPermission(); } catch { perm = Notification.permission; }
+  }
+  if (perm !== 'granted') { pushState = perm === 'denied' ? 'denied' : 'prompt'; return; }
+
+  const { webPublicKey } = await pushConfig();
+  if (!webPublicKey) { pushState = 'error'; return; }
+
+  const reg = await navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready);
+  let sub = await reg.pushManager.getSubscription();
+
+  // A subscription made against an older server key can never be delivered to.
+  if (sub && sub.options?.applicationServerKey && bytesToB64(sub.options.applicationServerKey) !== webPublicKey) {
+    try { await sub.unsubscribe(); } catch {}
+    sub = null;
+  }
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(webPublicKey) });
+  }
+  await api('/push/subscribe', { method: 'POST', body: { kind: 'web', subscription: sub.toJSON() } });
+  pushState = 'on';
+  defaultRemindersOn();
+}
+
+/** Get this device ready to receive new-task notifications. Safe to call any time. */
+let pushInFlight = null;
+function enablePush(opts = {}) {
+  // A tap on Allow runs at once: a browser prompt can sit unanswered for ever,
+  // and the tap must not queue behind it. Subscribing twice is harmless.
+  if (opts.ask) return doEnablePush(opts);
+  if (!pushInFlight) pushInFlight = doEnablePush(opts).finally(() => { pushInFlight = null; });
+  return pushInFlight;
+}
+async function doEnablePush({ ask = true } = {}) {
+  if (!state.user) return;
+  try {
+    const pn = pushNative();
+    if (isNativeApp() || pn) {
+      if (pn) await enableNativePush(pn, { ask });
+      else pushState = 'no-fcm';
+    } else {
+      await enableWebPush({ ask });
+    }
+  } catch (err) {
+    console.warn('[HomeBoard] could not turn on push', err);
+    pushState = 'error';
+  }
+  updatePushUi();
+  armGestureAsk();
+}
+
+/*
+ * Browsers ignore a permission request that is not tied to a tap. If the
+ * automatic ask at sign-in was swallowed, ask again on the very next tap.
+ */
+function armGestureAsk() {
+  if (pushState !== 'prompt' || gestureAskArmed) return;
+  gestureAskArmed = true;
+  const once = () => {
+    document.removeEventListener('pointerup', once, true);
+    gestureAskArmed = false;
+    if (pushState === 'prompt') enablePush({ ask: true });
+  };
+  document.addEventListener('pointerup', once, true);
+}
+
+async function disablePush() {
+  try {
+    const token = localStorage.getItem('hb.fcmToken');
+    if (token) {
+      await api('/push/unsubscribe', { method: 'POST', body: { kind: 'fcm', token } });
+      localStorage.removeItem('hb.fcmToken');
+    }
+    if (!isNativeApp() && 'serviceWorker' in navigator && 'PushManager' in window) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      const sub = await reg?.pushManager.getSubscription();
+      if (sub) {
+        await api('/push/unsubscribe', { method: 'POST', body: { kind: 'web', subscription: sub.toJSON() } });
+        await sub.unsubscribe();
+      }
+    }
+  } catch { /* signing out goes ahead regardless */ }
+  pushState = 'unknown';
+  updatePushUi();
+}
+
+async function openTaskFromPush(taskId) {
+  if (!taskId || !state.user) return;
+  if (!state.tasks.some((t) => t.id === taskId)) { try { await loadAll(); } catch {} }
+  const task = state.tasks.find((t) => t.id === taskId);
+  if (!task) { toast('That task is no longer on the board.'); return; }
+  if (task.projectId !== state.activeId) { state.activeId = task.projectId; localStorage.setItem('hb.board', task.projectId); render(); }
+  openDetail(taskId);
+}
+
+function updatePushUi() {
+  const banner = $('#push-banner');
+  const text = $('#push-banner-text');
+  const bannerBtn = $('#push-banner-btn');
+  const status = $('#push-status');
+  const allow = $('#push-allow');
+  const test = $('#push-test');
+  const signedIn = Boolean(state.user);
+
+  const copy = {
+    on: 'On — you get a notification as soon as someone puts a task on your plate, even with HomeBoard closed.',
+    prompt: 'Not on yet. Tap Allow so new tasks reach you with HomeBoard closed.',
+    denied: isNativeApp()
+      ? 'Blocked. Turn on Settings → Apps → HomeBoard → Notifications, then come back.'
+      : 'Blocked by your browser. Allow notifications for this site in the padlock menu, then reload.',
+    unsupported: /iPhone|iPad/.test(navigator.userAgent)
+      ? 'On iPhone, add HomeBoard to your Home Screen first (Share → Add to Home Screen), then open it from there.'
+      : 'This browser cannot receive notifications. Install the app, or use Chrome, Edge or Firefox.',
+    'no-fcm': 'This build of the app was made without Firebase, so it cannot receive new-task notifications. Rebuild it with the FIREBASE secret set (see README).',
+    error: 'Could not turn notifications on. Check your connection and try again.',
+    unknown: 'Checking notifications…',
+  };
+
+  if (status) status.textContent = copy[pushState] || copy.unknown;
+  allow?.classList.toggle('hidden', !(pushState === 'prompt' || pushState === 'error'));
+  test?.classList.toggle('hidden', pushState !== 'on');
+
+  const showBanner = signedIn && (pushState === 'prompt' || pushState === 'denied');
+  banner?.classList.toggle('hidden', !showBanner);
+  if (text) text.textContent = pushState === 'denied' ? copy.denied : 'So you hear about new tasks the moment they are put on your plate.';
+  bannerBtn?.classList.toggle('hidden', pushState !== 'prompt');
+}
+
+$('#push-banner-btn').addEventListener('click', () => enablePush({ ask: true }));
+$('#push-allow').addEventListener('click', () => enablePush({ ask: true }));
+$('#push-test').addEventListener('click', async () => {
+  try {
+    const out = await api('/push/test', { method: 'POST' });
+    toast(out.sent ? 'Sent — it should appear in a moment. Try it with the app closed, too.' : 'No device took it. Try Allow again.');
+  } catch (err) { toast(err.message); }
+});
+
+// Messages from the service worker.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    const msg = e.data || {};
+    if (msg.type === 'hb-push') refreshNow({ silent: true });
+    else if (msg.type === 'hb-open-task') openTaskFromPush(msg.taskId);
+    else if (msg.type === 'hb-resubscribe') enablePush({ ask: false });
+  });
+}
+
+// Coming back after changing the setting in Android or the browser.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.user && pushState !== 'on') enablePush({ ask: false });
+});
+
 /* ───────────────────────── QR invites ───────────────────────── */
 
 const joinLink = (project) => `${location.origin}/?join=${encodeURIComponent(project.inviteCode)}`;
@@ -1550,11 +1838,21 @@ async function boot() {
   $('#app-screen').classList.remove('hidden');
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
   $('#my-avatar').textContent = initials(state.user.name);
+  // Straight after sign-in, before anything else: get this device ready for
+  // new-task notifications. First, so the prompt still counts as coming from
+  // the Sign in tap.
+  enablePush({ ask: true });
   await syncRemindersToggle();
   await loadAll();
   await consumePendingJoin();
   scheduleReminders();
   startPolling();
+  // Opened from a notification in a browser.
+  const fromPush = new URLSearchParams(location.search).get('task');
+  if (fromPush) {
+    history.replaceState({}, '', location.pathname);
+    openTaskFromPush(fromPush);
+  }
 }
 
 (async function start() {

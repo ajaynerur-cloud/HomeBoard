@@ -22,3 +22,8 @@ services:
         value: main
       - key: DATA_DIR
         value: data
+      # New-task push to the Android APK. Paste the Firebase service-account
+      # JSON (raw or base64). Web push needs nothing — its keys are generated
+      # on first start and kept in the private data repo.
+      - key: FCM_SERVICE_ACCOUNT
+        sync: false

@@ -28,6 +28,8 @@ stays clean but you can still see who did what.
 - **Boards** — one board per household or project. Invite by email, by 8-character code, or by **QR**.
 - **Push a task to someone** — pick any member as the owner. It lands on their "For me" tab.
 - **Live countdown** — `2h 23m left`, `5h overdue`. Colour-coded, refreshes on its own.
+- **New-task notifications** — the moment someone puts a task on your plate (or hands you one),
+  your phone buzzes, even with HomeBoard closed. Permission is asked for straight after sign-in.
 - **Reminders** — a real notification when time runs out. On Android these are scheduled with the
   operating system, so they arrive with HomeBoard closed.
 - **Stays in sync** — everyone's board updates on its own. Poll every 20 seconds while the app is
@@ -50,7 +52,7 @@ This is the part worth understanding before you start.
 
 ```
   homeboard              PUBLIC    the code in this folder
-  homeboard-data         PRIVATE   users.json, projects.json, tasks.json, history.json
+  homeboard-data         PRIVATE   users.json, projects.json, tasks.json, history.json, push.json
 ```
 
 The server never stores anything on disk in production. Every write is a commit
@@ -237,12 +239,54 @@ fixed. Rebuild from the current workflow and reinstall. You can confirm a good b
 workflow log: the "Check plugins registered" step prints
 
 ```
-Plugins registered: @capacitor/app, @capacitor/local-notifications
+Plugins registered: @capacitor/app, @capacitor/local-notifications, @capacitor/push-notifications
+Firebase: google-services.json present for com.homeboard.app — new-task push notifications ON.
 Manifest now declares: SCHEDULE_EXACT_ALARM, POST_NOTIFICATIONS, RECEIVE_BOOT_COMPLETED, VIBRATE, INTERNET
 ```
 </details>
 
-### 7. The cold start, and what to do about it
+### 7. New-task push notifications
+
+When someone adds a task for you, or hands you one, the server pushes a notification to every
+device you're signed in on — *"New task from Alice · Take the bins out — Home"*. Tapping it opens
+that task. It arrives with HomeBoard closed, swiped away, or not opened since a restart.
+
+**Permission is asked for straight after sign-in** — there's no switch to find first. If the
+person ignores the prompt, a banner stays at the top of the board and the next tap anywhere asks
+again. Android 13+ and every browser still require the person to tap *Allow* once — no app can
+grant itself that permission; on Android 12 and older it is on from install. Once it's allowed,
+due-date reminders switch on too, unless someone has turned them off.
+
+**Account → New tasks** shows whether it's working, and has a *Send me a test* button.
+
+| Where | How it's delivered | Setup |
+|---|---|---|
+| Installed PWA / Chrome, Edge, Firefox | Web Push → the service worker shows it | **None.** Keys are generated on first start and saved in the data repo. |
+| iPhone | Web Push, only once added to the Home Screen (iOS 16.4+) | None |
+| The APK | Firebase Cloud Messaging — Android itself draws it | One-off Firebase setup, below |
+
+**Firebase setup for the APK (free, about ten minutes):**
+
+1. [console.firebase.google.com](https://console.firebase.google.com) → **Add project** (Analytics off is fine).
+2. **Add app → Android**, package name **`com.homeboard.app`** → download `google-services.json`.
+3. GitHub repo → **Settings → Secrets and variables → Actions → New repository secret** →
+   `GOOGLE_SERVICES_JSON` = the whole contents of that file.
+4. Firebase → ⚙ **Project settings → Service accounts → Generate new private key**. On Render, add
+   env var `FCM_SERVICE_ACCOUNT` = the contents of that JSON file (raw or base64). **Keep this one
+   secret** — it can send notifications as your project.
+5. Re-run **Build Android APK** and reinstall. `/api/health` should now say `"push":{"web":true,"fcm":true}`.
+
+Without step 3 the APK still builds and reminders still work, but Account says this build can't
+receive new-task notifications. Without step 4 the server keeps the phone's token and starts
+sending as soon as you add it.
+
+Optional env vars: `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` (pin your own web-push keys),
+`VAPID_SUBJECT` (a `mailto:` for push services to contact you).
+
+> The same phone-maker battery rules as reminders apply: on Realme, Oppo, Xiaomi and some Samsungs,
+> set HomeBoard's battery use to *Unrestricted*, or high-priority pushes can still be held back.
+
+### 8. The cold start, and what to do about it
 
 A free Render service spins down after about 15 minutes with no traffic. The
 next request wakes it, which takes 30–50 seconds, and while that happens Render
@@ -307,6 +351,10 @@ Two more suites:
 npm run test:store   # the GitHub datastore against a fake Contents API —
                      # sha conflicts, 20 concurrent writers, queue recovery
 npm run test:qr      # the QR encoder against verified golden matrices
+npm run test:push    # new-task push end to end: real encryption against a fake push
+                     # service, and FCM against a stand-in Google (HB_TEST_FCM=1)
+node scripts/push-ui-test.js  # the browser half in Chromium: prompt on sign-in,
+                     # subscription, notification with the page closed, tap-to-open
 npm run test:reminders  # the Android reminder flow against a stand-in plugin —
                      # permission granted, refused, already denied, revoked,
                      # and exact alarms disallowed
@@ -359,7 +407,11 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/tasks/restore` | undo a completion (the task comes back from the client) |
 | `DELETE` | `/tasks/:id` | delete with no record |
 | `GET` | `/tasks/history/list` | what's been finished |
-| `GET` | `/health` | status + which storage backend is live |
+| `GET` | `/push/config` | web-push public key, and whether Android push is on |
+| `POST` | `/push/subscribe` | register this device (`{kind:'web', subscription}` or `{kind:'fcm', token}`) |
+| `POST` | `/push/unsubscribe` | stop pushing to this device (done on sign-out) |
+| `POST` | `/push/test` | send yourself a test notification |
+| `GET` | `/health` | status, storage backend, and which push channels are live |
 
 ## What's stored
 
@@ -406,7 +458,8 @@ server/
   index.js          express app, static hosting, error handling
   store.js          the GitHub-JSON datastore (+ local fallback)
   auth.js           hashing, tokens, the requireAuth middleware
-  routes/           auth.js · projects.js · tasks.js
+  push.js           new-task notifications: Web Push + Firebase, device list, pruning
+  routes/           auth.js · projects.js · tasks.js · push.js
 public/
   index.html        the whole UI shell
   app.js            front end — vanilla JS, no framework, no build step
