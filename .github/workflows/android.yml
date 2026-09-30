@@ -116,6 +116,28 @@ jobs:
       - name: Create the native project
         run: '[ -d android ] || npx cap add android'
 
+      # New-task push notifications on Android go through Firebase Cloud
+      # Messaging. Add the file Firebase gives you as a repo secret named
+      # GOOGLE_SERVICES_JSON (raw JSON or base64). Without it the APK still
+      # builds and reminders still work, but new tasks will not be pushed.
+      - name: Add Firebase config (push notifications)
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "::warning::No GOOGLE_SERVICES_JSON secret — this APK will not receive new-task push notifications."
+            exit 0
+          fi
+          node -e '
+            const fs = require("fs");
+            let raw = process.env.GOOGLE_SERVICES_JSON.trim();
+            if (!raw.startsWith("{")) raw = Buffer.from(raw, "base64").toString("utf8");
+            JSON.parse(raw); // fail loudly on a bad paste
+            fs.writeFileSync("android/app/google-services.json", raw);
+            fs.appendFileSync("public/config.js", "window.HOMEBOARD_FCM = true;\n");
+          '
+          echo "Firebase config written; push enabled in public/config.js"
+
       - name: Generate launcher icons and splash
         run: npx @capacitor/assets generate --android --assetPath resources
 
