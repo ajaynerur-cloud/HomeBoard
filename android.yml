@@ -1,0 +1,168 @@
+name: Build Android APK
+
+# Builds an installable HomeBoard APK in the cloud — no Android Studio needed.
+# Run it from the Actions tab: "Build Android APK" → "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: "Your live HomeBoard URL (e.g. https://homeboard.onrender.com)"
+        required: true
+  push:
+    tags: ["v*"]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # JDK 17, not 21. Capacitor 6 generates a project on Gradle 8.2.1, and
+      # Gradle only supports running on Java 21 from 8.5 onwards — on 21 this
+      # build dies with "Unsupported Java". 17 is what AGP 8.2.1 wants anyway.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          # No `cache: gradle` here. It globs for Gradle files at checkout time,
+          # but android/ is generated later by `cap add android`, so it fails
+          # with "No file matched to [**/*.gradle*...]". Cached separately below.
+
+      # No android-actions/setup-android here on purpose.
+      # Google removed the legacy "tools" SDK package in September 2026, and
+      # that action still asks for it by default, so it fails with
+      # "sdkmanager failed with exit code 1" on every run.
+      # The ubuntu-latest runner already ships the Android SDK, and the Android
+      # Gradle Plugin downloads whatever platform and build-tools it needs.
+      - name: Check the Android SDK and accept licences
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "No Android SDK on this runner at $ANDROID_HOME."
+            exit 1
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "Using SDK at $ANDROID_HOME"
+          # Already accepted on the hosted image; harmless belt-and-braces.
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('package.json', 'capacitor.config.json') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Point the app at the live server
+        env:
+          URL_INPUT: ${{ github.event.inputs.server_url }}
+          URL_VAR: ${{ vars.HOMEBOARD_URL }}
+        run: |
+          export APP_URL="${URL_INPUT:-$URL_VAR}"
+          if [ -z "$APP_URL" ]; then
+            echo "No server URL. Pass it when you run the workflow, or set a repo variable HOMEBOARD_URL."
+            exit 1
+          fi
+          case "$APP_URL" in
+            https://*) ;;
+            *) echo "The URL must start with https:// — got '$APP_URL'"; exit 1 ;;
+          esac
+          APP_URL="${APP_URL%/}"
+
+          # The APK carries its own copy of the web app and loads it from
+          # https://localhost, so it never renders the host's "waking up" page.
+          # It only needs to know where the API lives.
+          node -e '
+            const fs = require("fs");
+            const url = process.env.APP_URL;
+            fs.writeFileSync("public/config.js",
+              "/* Written by the Android build. Do not edit. */\n" +
+              "window.HOMEBOARD_API = " + JSON.stringify(url) + ";\n");
+          '
+          echo "--- public/config.js ---"
+          cat public/config.js
+
+          # Fail early if that URL is not actually a HomeBoard server, rather
+          # than shipping an APK that can never sign anyone in.
+          echo "Checking $APP_URL/api/health (the server may need to wake up)…"
+          for i in $(seq 1 12); do
+            BODY="$(curl -fsS --max-time 20 "$APP_URL/api/health" || true)"
+            case "$BODY" in
+              *'"app":"HomeBoard"'*) echo "OK: $BODY"; exit 0 ;;
+            esac
+            echo "  attempt $i — not ready yet"
+            sleep 10
+          done
+          echo "No HomeBoard health response from $APP_URL/api/health after two minutes."
+          echo "Check the URL, and that the service is deployed."
+          exit 1
+
+      # A plain install, including devDependencies — that is where the Capacitor
+      # packages live. They must be in package.json: the Capacitor CLI finds
+      # plugins by reading it, so installing them with --no-save leaves them on
+      # disk but invisible, and the APK comes out with no notification code.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Create the native project
+        run: '[ -d android ] || npx cap add android'
+
+      # New-task push notifications on Android go through Firebase Cloud
+      # Messaging. Add the file Firebase gives you as a repo secret named
+      # GOOGLE_SERVICES_JSON (raw JSON or base64). Without it the APK still
+      # builds and reminders still work, but new tasks will not be pushed.
+      - name: Add Firebase config (push notifications)
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "::warning::No GOOGLE_SERVICES_JSON secret — this APK will not receive new-task push notifications."
+            exit 0
+          fi
+          node -e '
+            const fs = require("fs");
+            let raw = process.env.GOOGLE_SERVICES_JSON.trim();
+            if (!raw.startsWith("{")) raw = Buffer.from(raw, "base64").toString("utf8");
+            JSON.parse(raw); // fail loudly on a bad paste
+            fs.writeFileSync("android/app/google-services.json", raw);
+            fs.appendFileSync("public/config.js", "window.HOMEBOARD_FCM = true;\n");
+          '
+          echo "Firebase config written; push enabled in public/config.js"
+
+      - name: Generate launcher icons and splash
+        run: npx @capacitor/assets generate --android --assetPath resources
+
+      - name: Sync
+        run: npx cap sync android
+
+      - name: Check plugins registered, add notification permissions
+        run: node scripts/patch-android-manifest.js
+
+      - name: Assemble debug APK
+        run: |
+          echo "Java:   $(java -version 2>&1 | head -1)"
+          echo "Gradle: $(grep distributionUrl android/gradle/wrapper/gradle-wrapper.properties)"
+          if [ ! -x android/gradlew ] && [ ! -f android/gradlew ]; then
+            echo "No android/gradlew — the native project was not generated."
+            echo "Contents of the workspace:"
+            ls -la
+            exit 1
+          fi
+          cd android
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeBoard-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
