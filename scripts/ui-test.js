@@ -167,8 +167,10 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   await p2.click('.tabs button[data-view=sent]');
   await p2.waitForTimeout(400);
   check('shows under "I assigned" for the sender', await p2.locator('.task-title',{hasText:'Call the plumber'}).count()>0);
+  await p2.click('#refresh-btn');           // send it
+  await p2.waitForTimeout(1500);
 
-  await p.reload();
+  await p.reload();                         // opening the app syncs (safety net on by default)
   await p.waitForTimeout(1600);
   check('lands on the other person\'s "For me"', await p.locator('.task-title',{hasText:'Call the plumber'}).count()>0);
 
@@ -181,14 +183,19 @@ const check=(l,c,d)=>c?ok(l):bad(l,d);
   await p2.click('#task-save');
   await p2.waitForTimeout(1200);
 
-  console.log('  (waiting for the poll to bring it across…)');
-  await p.waitForSelector('.task-title:has-text("Defrost the freezer")', { timeout: 30000 });
-  check('a task added by someone else appears without a reload', true);
-
-  // Explicit refresh button
-    await p.click('#refresh-btn');
+  // Offline-first: it is on p2's device only until p2 syncs.
+  check('the sender sees it straight away', await p2.locator('.task-title',{hasText:'Defrost the freezer'}).count()>0);
+  check('the sync button shows a change waiting', (await p2.textContent('#sync-badge')).trim() === '1');
+  await p.click('#refresh-btn');
   await p.waitForTimeout(1200);
-  check('the refresh button works', await p.locator('.task').count() >= 1);
+  check('the other person does not get it before the sender syncs',
+        await p.locator('.task-title',{hasText:'Defrost the freezer'}).count()===0);
+  await p2.click('#refresh-btn');
+  await p2.waitForTimeout(1500);
+  check('after syncing, nothing is waiting', await p2.locator('#sync-badge.hidden').count() === 1);
+  await p.click('#refresh-btn');
+  await p.waitForSelector('.task-title:has-text("Defrost the freezer")', { timeout: 10000 });
+  check('Sync now brings the other person\'s task across', true);
 
   // Hand the board over. Person 1 created the board, so person 1 owns it.
   await p.click('#open-members');

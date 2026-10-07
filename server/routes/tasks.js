@@ -9,6 +9,27 @@ router.use(requireAuth);
 
 const PRIORITIES = ['low', 'normal', 'high'];
 
+/*
+ * Offline-first support. The app works from a copy on the device and sends its
+ * changes when it syncs, so it makes ids itself and tells us when things
+ * happened. Ids are accepted only in our own shape; times only if they are
+ * real and not in the future. A replayed request (the reply was lost on a bad
+ * signal and the app sent it again) is answered with what is already there
+ * instead of making a duplicate.
+ */
+const clientId = (value, prefix) =>
+  typeof value === 'string' && new RegExp(`^${prefix}_[A-Za-z0-9_-]{8,48}$`).test(value) ? value : null;
+
+function clientTime(value, { notBefore = 0 } = {}) {
+  if (!value) return null;
+  const t = Date.parse(value);
+  if (!Number.isFinite(t)) return null;
+  const now = Date.now();
+  if (t > now + 60 * 1000) return new Date(now).toISOString(); // device clock ahead
+  if (t < notBefore || t < now - 90 * 24 * 3600 * 1000) return null;
+  return new Date(t).toISOString();
+}
+
 async function loadProject(projectId, userId) {
   const projects = await store.read('projects');
   const project = projects.find((p) => p.id === projectId);
@@ -79,9 +100,21 @@ router.post('/', async (req, res, next) => {
     if (!project.members.some((m) => m.userId === assigneeId))
       return res.status(400).json({ error: 'That person is not on this board.' });
 
+    // Made on a device while offline — it already has an id.
+    const wantedId = clientId(req.body?.id, 'tsk');
+    if (wantedId) {
+      const already = (await store.read('tasks')).find((t) => t.id === wantedId);
+      if (already) {
+        if (already.createdById !== req.user.id || already.projectId !== project.id)
+          return res.status(409).json({ error: 'That task id is taken.' });
+        const [decorated] = await decorate([already]);
+        return res.status(200).json({ task: decorated, replayed: true });
+      }
+    }
+
     const now = new Date().toISOString();
     const task = {
-      id: newId('tsk'),
+      id: wantedId || newId('tsk'),
       projectId: project.id,
       title: title.slice(0, 120),
       details: String(req.body?.details || '').slice(0, 4000),
@@ -91,11 +124,11 @@ router.post('/', async (req, res, next) => {
       dueAt: sanitiseDue(req.body?.dueAt),
       priority: PRIORITIES.includes(req.body?.priority) ? req.body.priority : 'normal',
       comments: [],
-      createdAt: now,
+      createdAt: clientTime(req.body?.createdAt) || now,
       updatedAt: now,
     };
 
-    await store.update('tasks', (rows) => { rows.push(task); }, `HomeBoard: new task "${task.title}"`);
+    await store.update('tasks', (rows) => { if (!rows.some((t) => t.id === task.id)) rows.push(task); }, `HomeBoard: new task "${task.title}"`);
 
     // Tell the person it was pushed to, straight away. Not awaited: a slow push
     // service must never hold up the person creating the task.
@@ -169,7 +202,12 @@ router.post('/:id/comments', async (req, res, next) => {
       const t = rows.find((x) => x.id === req.params.id);
       if (!t) return { code: 404, error: 'Task not found.' };
       t.comments = t.comments || [];
-      t.comments.push({ id: newId('cmt'), userId: req.user.id, text: text.slice(0, 1000), at: new Date().toISOString() });
+      const id = clientId(req.body?.id, 'cmt');
+      if (id && t.comments.some((c) => c.id === id)) return { task: t }; // replayed
+      t.comments.push({
+        id: id || newId('cmt'), userId: req.user.id, text: text.slice(0, 1000),
+        at: clientTime(req.body?.at) || new Date().toISOString(),
+      });
       t.updatedAt = new Date().toISOString();
       return { task: t };
     }, 'HomeBoard: task note added');
@@ -195,14 +233,16 @@ router.post('/:id/complete', async (req, res, next) => {
     const { error } = await loadProject(existing.projectId, req.user.id);
     if (error) return res.status(error.code).json({ error: error.message });
 
+    // Finished offline: keep the moment it was really done, not when it synced.
+    const completedAt = clientTime(req.body?.completedAt) || new Date().toISOString();
     const entry = {
-      id: newId('hst'),
+      id: clientId(req.body?.historyId, 'hst') || newId('hst'),
       projectId: existing.projectId,
       title: existing.title,
       completedById: req.user.id,
       assignedToId: existing.assigneeId || null,
-      completedAt: new Date().toISOString(),
-      wasLate: existing.dueAt ? Date.now() > Date.parse(existing.dueAt) : false,
+      completedAt,
+      wasLate: existing.dueAt ? Date.parse(completedAt) > Date.parse(existing.dueAt) : false,
     };
 
     await store.update('tasks', (rows) => {

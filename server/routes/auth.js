@@ -100,6 +100,17 @@ router.get('/me', requireAuth, (req, res) => {
 });
 
 /**
+ * Swap a still-valid session for a fresh 30-day one. The app calls this after
+ * a fingerprint unlock, so someone who opens HomeBoard at least once a month
+ * never has to type their password again on that phone.
+ */
+router.post('/refresh', requireAuth, (req, res) => {
+  const token = signToken(req.user);
+  setAuthCookie(res, token);
+  res.json({ token, user: publicUser(req.user) });
+});
+
+/**
  * Delete the account and everything tied to it.
  *
  * Boards you own alone go with you. Boards you own with other people do not —

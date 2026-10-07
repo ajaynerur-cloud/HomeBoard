@@ -32,8 +32,12 @@ stays clean but you can still see who did what.
   your phone buzzes, even with HomeBoard closed. Permission is asked for straight after sign-in.
 - **Reminders** — a real notification when time runs out. On Android these are scheduled with the
   operating system, so they arrive with HomeBoard closed.
-- **Stays in sync** — everyone's board updates on its own. Poll every 20 seconds while the app is
-  open, plus a refresh button, pull-to-refresh, and a refresh whenever you come back to it.
+- **Offline-first, you choose when to sync** — everything is saved on the phone first, instantly,
+  with or without signal. The sync button (or pull-down) sends your changes and fetches everyone
+  else's; a badge shows how many are waiting. Account → Sync sets a safety net: every 5/15/30/60
+  minutes and/or on open and leave — or switch both off for fully manual sync.
+- **Fingerprint unlock** — sign in with your password once, then open HomeBoard with your
+  fingerprint. Native prompt in the APK, the phone's built-in authenticator in the browser.
 - **Details** — free-text notes, a checklist of steps, priority, and a due date with one-tap presets.
 - **Track** — tabs for *For me*, *Whole board*, *I assigned*, and *Finished*.
 - **Hand off** — reassign a task from inside it, or hand the whole board to someone else.
@@ -45,6 +49,48 @@ stays clean but you can still see who did what.
   close the app from inside it.
 - **Works offline** — the app shell is cached; it opens instantly and survives a dead signal.
 - **Light and dark** — follows the system, or force one in Account.
+
+## Offline and sync
+
+The app keeps a copy of your boards on the device and works from it. Every change — new task,
+edit, note, tick, finish, delete — is applied on the phone at once and put in an **outbox**.
+**Sync** sends the outbox to the server one change at a time, in order, then downloads a fresh copy.
+What you see is always *last download + your unsent changes*, so a download never loses anything.
+
+| Setting (Account → Sync) | Default |
+|---|---|
+| Sync automatically | every 15 minutes (choose *Never* for manual only) |
+| Also sync when I open or leave HomeBoard | on |
+
+- Opens with no signal, from the local copy. Coming back online does **not** sync by itself in
+  manual mode.
+- A task made and deleted before syncing never reaches the server. Several edits to one task go as one.
+- If someone else finished or deleted a task you changed offline, that change is dropped and you're
+  told which one. Edits otherwise win field by field, last sync wins.
+- Finishing offline keeps the real finish time (and the *late* flag) when it syncs.
+- A request replayed after a lost reply doesn't duplicate: the app makes its own ids and the server
+  answers a repeat with what it already has.
+- Boards, invites and members still need the server — they work online only.
+- Account → *How sync works* → **Save a copy of my data (JSON)** exports the local copy.
+- Signing out with unsynced changes offers to sync first.
+
+## Fingerprint unlock
+
+After a password sign-in, the board shows **Open with your fingerprint** (also in Account).
+
+| Where | How |
+|---|---|
+| The APK | Android's BiometricPrompt via `@capgo/capacitor-native-biometric` |
+| Phone browser / installed PWA | WebAuthn with the built-in authenticator (fingerprint, face, or screen lock) |
+
+Every time the app opens — and when it comes back after 5 minutes in the background — it shows a
+lock screen and asks for the fingerprint. **Use my password instead** is always there. The
+fingerprint stays on the phone; it unlocks the session already on the device, and each unlock calls
+`POST /api/auth/refresh` for a fresh 30-day session, so the password isn't needed again as long as
+the app is opened once a month. Signing out ends the session and turns fingerprint off.
+
+Rebuild the APK to get it (the plugin is in `devDependencies`, and `patch-android-manifest.js`
+now checks it registered and adds `USE_BIOMETRIC`). Browser fingerprint needs HTTPS (Render gives you that).
 
 ## The two repos
 
@@ -378,7 +424,9 @@ node scripts/push-ui-test.js  # the browser half in Chromium: prompt on sign-in,
 npm run test:reminders  # the Android reminder flow against a stand-in plugin —
                      # permission granted, refused, already denied, revoked,
                      # and exact alarms disallowed
-npm run test:ui      # 42 real browser assertions through the whole UI
+npm run test:sync    # offline-first: offline edits, offline reopen, manual sync, conflicts
+npm run test:fingerprint  # WebAuthn virtual authenticator + stand-in native plugin
+npm run test:ui      # 45 real browser assertions through the whole UI
                      # (needs: npm i --no-save playwright && npx playwright install chromium)
 ```
 
@@ -409,6 +457,7 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/auth/signin` | sign in |
 | `POST` | `/auth/signout` | clear the cookie |
 | `GET` | `/auth/me` | current user |
+| `POST` | `/auth/refresh` | a fresh 30-day token (after a fingerprint unlock) |
 | `GET` | `/projects` | boards you're on |
 | `POST` | `/projects` | create a board |
 | `PATCH` | `/projects/:id` | rename (owner) |
@@ -420,7 +469,7 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/projects/:id/transfer-owner` | hand the board to another member |
 | `DELETE` | `/auth/me` | delete the account and everything only it owns |
 | `GET` | `/tasks` | live tasks on your boards |
-| `POST` | `/tasks` | create / push to someone |
+| `POST` | `/tasks` | create / push to someone (accepts the app's own `id`, idempotent) |
 | `PATCH` | `/tasks/:id` | edit, reassign, tick a step |
 | `POST` | `/tasks/:id/comments` | add a note |
 | `POST` | `/tasks/:id/complete` | **delete the task**, keep a name-only record |

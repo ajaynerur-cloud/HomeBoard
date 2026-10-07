@@ -46,7 +46,18 @@ const RETRY_STATUS = new Set([408, 502, 503, 504]);
 const BACKOFF = [800, 1500, 2500, 4000, 6000, 8000, 10000, 12000];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function api(path, { method = 'GET', body } = {}) {
+/**
+ * `background: true` is for sync — no full-screen waking overlay (the sync
+ * button spins instead), so working from the local copy is never blocked.
+ * Errors carry `.status` (server said no) or `.offline` (never got an answer),
+ * which is how sync tells "drop this change" from "try again later".
+ */
+function apiError(message, extra) { return Object.assign(new Error(message), extra); }
+
+async function api(path, { method = 'GET', body, background = false } = {}) {
+  if (navigator.onLine === false) {
+    throw apiError('You are offline. Your changes are kept on this device until you sync.', { offline: true });
+  }
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const token = getToken();
@@ -96,15 +107,16 @@ async function api(path, { method = 'GET', body } = {}) {
 
     if (transient) {
       const elapsed = Date.now() - started;
-      if (elapsed < WAKE_DEADLINE_MS) {
-        showWaking();
+      if (elapsed < WAKE_DEADLINE_MS && navigator.onLine !== false) {
+        if (!background) showWaking(); else setSyncNote('Waking the server…');
         await sleep(BACKOFF[Math.min(attempt, BACKOFF.length - 1)]);
         attempt++;
         continue;
       }
       hideWaking();
-      throw new Error(
-        `Could not reach HomeBoard — ${lastReason}. If it has been asleep a while, give it a moment and try again.`
+      throw apiError(
+        `Could not reach HomeBoard — ${lastReason}. If it has been asleep a while, give it a moment and try again.`,
+        { offline: true }
       );
     }
 
@@ -117,9 +129,9 @@ async function api(path, { method = 'GET', body } = {}) {
       setToken(null);
       state.user = null;
       showAuth();
-      throw new Error(data.error || 'Please sign in again.');
+      throw apiError(data.error || 'Please sign in again.', { status: 401, auth: true });
     }
-    if (!res.ok) throw new Error(data.error || `Something went wrong (${res.status}).`);
+    if (!res.ok) throw apiError(data.error || `Something went wrong (${res.status}).`, { status: res.status });
     return data;
   }
 }
@@ -312,6 +324,7 @@ $('#auth-form').addEventListener('submit', async (e) => {
 
 function showAuth() {
   $('#app-screen').classList.add('hidden');
+  $('#lock-screen')?.classList.add('hidden');
   $('#auth-screen').classList.remove('hidden');
   closeSheet();
 }
@@ -436,30 +449,403 @@ function tickCountdowns() {
 }
 setInterval(tickCountdowns, 30000);
 
-/* ───────────────────────── data loading ───────────────────────── */
+/* ───────────────────────── local copy + sync ───────────────────────── */
 
-async function loadAll() {
-  const [{ projects }, { tasks }, { history }] = await Promise.all([
-    api('/projects'),
-    api('/tasks'),
-    api('/tasks/history/list'),
-  ]);
-  state.projects = projects;
-  state.tasks = tasks;
-  state.history = history;
-  if (!state.projects.some((p) => p.id === state.activeId)) {
-    state.activeId = state.projects[0]?.id || null;
-  }
-  render();
+/*
+ * Offline-first. Everything you see comes from a copy kept on this device, and
+ * every change you make lands there instantly — no network, no waiting.
+ *
+ *   base     the last copy downloaded from the server
+ *   outbox   your changes since then, in order, not yet sent
+ *   screen   base with the outbox replayed on top
+ *
+ * Sync sends the outbox one change at a time, then downloads a fresh base.
+ * Because the screen is always "base + outbox", a download can happen at any
+ * moment without losing anything you have not sent yet.
+ *
+ * Sync runs when you press it. Account → Sync adds a safety net: every N
+ * minutes, and/or when you open or leave the app. Both can be switched off.
+ */
+const SYNC_EVERY_KEY = 'hb.syncEvery';       // minutes, '0' = manual only
+const SYNC_EDGES_KEY = 'hb.syncOnOpenLeave'; // '1' | '0'
+const DEFAULT_SYNC_EVERY = 15;
+
+const local = { base: null, outbox: [], lastSyncAt: null, lastError: '', serverHasNews: false };
+let syncing = null;
+
+const localKey  = () => `hb.local.${state.user.id}`;
+const outboxKey = () => `hb.outbox.${state.user.id}`;
+
+function syncEvery() {
+  const raw = localStorage.getItem(SYNC_EVERY_KEY);
+  if (raw === null || raw === '') return DEFAULT_SYNC_EVERY;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : DEFAULT_SYNC_EVERY;
+}
+const syncOnEdges = () => localStorage.getItem(SYNC_EDGES_KEY) !== '0';
+
+function rid(prefix) {
+  const bytes = new Uint8Array(9);
+  (window.crypto || {}).getRandomValues?.(bytes);
+  if (!bytes.some(Boolean)) for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return `${prefix}_${[...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-async function refreshTasks() {
-  const [{ tasks }, { history }] = await Promise.all([api('/tasks'), api('/tasks/history/list')]);
+const clone = (v) => JSON.parse(JSON.stringify(v));
+
+function saveLocal() {
+  if (!state.user) return;
+  try {
+    localStorage.setItem('hb.user', JSON.stringify(state.user));
+    localStorage.setItem(localKey(), JSON.stringify({ base: local.base, lastSyncAt: local.lastSyncAt }));
+    localStorage.setItem(outboxKey(), JSON.stringify(local.outbox));
+  } catch (err) {
+    console.warn('[HomeBoard] could not save the local copy', err);
+    toast('This device is out of space for HomeBoard — sync now so nothing is lost.');
+  }
+}
+
+function loadLocal() {
+  local.base = null; local.outbox = []; local.lastSyncAt = null; local.lastError = '';
+  if (!state.user) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(localKey()) || 'null');
+    if (saved?.base) { local.base = saved.base; local.lastSyncAt = saved.lastSyncAt || null; }
+    local.outbox = JSON.parse(localStorage.getItem(outboxKey()) || '[]') || [];
+  } catch { /* a corrupt copy just means a fresh download */ }
+}
+
+function forgetLocal() {
+  if (state.user) {
+    localStorage.removeItem(localKey());
+    localStorage.removeItem(outboxKey());
+  }
+  localStorage.removeItem('hb.user');
+  local.base = null; local.outbox = []; local.lastSyncAt = null;
+}
+
+/* What the server would have added to a task, worked out from the board. */
+function memberUser(projectId, userId) {
+  if (!userId) return null;
+  if (userId === state.user?.id) return state.user;
+  for (const p of state.projects) {
+    if (projectId && p.id !== projectId) continue;
+    const m = p.members.find((x) => x.user?.id === userId);
+    if (m) return m.user;
+  }
+  return null;
+}
+function decorateLocal(t) {
+  t.assignee = memberUser(t.projectId, t.assigneeId);
+  t.createdBy = memberUser(t.projectId, t.createdById);
+  t.comments = (t.comments || []).map((c) => ({ ...c, author: c.author || memberUser(t.projectId, c.userId) }));
+  return t;
+}
+/** The task as the server stores it — no decorations. */
+function rawTask(t) {
+  const { assignee, createdBy, ...rest } = t;
+  return { ...rest, comments: (t.comments || []).map(({ author, ...c }) => c) };
+}
+
+function applyOp(tasks, history, op) {
+  const find = (id) => tasks.find((t) => t.id === id);
+  switch (op.type) {
+    case 'create':
+      if (!find(op.task.id)) tasks.push(clone(op.task));
+      break;
+    case 'update': {
+      const t = find(op.taskId);
+      if (t) Object.assign(t, clone(op.patch), { updatedAt: op.at });
+      break;
+    }
+    case 'comment': {
+      const t = find(op.taskId);
+      if (t && !(t.comments || []).some((c) => c.id === op.comment.id)) {
+        t.comments = [...(t.comments || []), { ...op.comment, userId: state.user.id }];
+      }
+      break;
+    }
+    case 'complete': {
+      const i = tasks.findIndex((t) => t.id === op.taskId);
+      if (i !== -1) tasks.splice(i, 1);
+      if (!history.some((h) => h.id === op.history.id)) history.unshift({ ...op.history, completedBy: state.user });
+      break;
+    }
+    case 'restore': {
+      if (!find(op.task.id)) tasks.push(clone(op.task));
+      const i = history.findIndex((h) => h.id === op.historyId);
+      if (i !== -1) history.splice(i, 1);
+      break;
+    }
+    case 'delete': {
+      const i = tasks.findIndex((t) => t.id === op.taskId);
+      if (i !== -1) tasks.splice(i, 1);
+      break;
+    }
+  }
+}
+
+/** Screen = base + outbox. */
+function rebuild() {
+  const base = local.base || { projects: [], tasks: [], history: [] };
+  state.projects = clone(base.projects || []);
+  const tasks = clone(base.tasks || []);
+  const history = clone(base.history || []);
+  for (const op of local.outbox) applyOp(tasks, history, op);
+  tasks.forEach(decorateLocal);
+  tasks.sort((a, b) => {
+    const ad = a.dueAt ? Date.parse(a.dueAt) : Infinity;
+    const bd = b.dueAt ? Date.parse(b.dueAt) : Infinity;
+    if (ad !== bd) return ad - bd;
+    return Date.parse(a.createdAt) - Date.parse(b.createdAt);
+  });
+  history.sort((a, b) => Date.parse(b.completedAt) - Date.parse(a.completedAt));
   state.tasks = tasks;
   state.history = history;
+  if (!state.projects.some((p) => p.id === state.activeId)) state.activeId = state.projects[0]?.id || null;
+}
+
+/** Re-draw everything that shows tasks. */
+function redraw() {
+  rebuild();
   render();
+  if (openSheet === $('#sheet-detail') && state.detailId) renderDetail();
+  if (openSheet === $('#sheet-members')) renderMembers();
+  updateSyncUi();
+}
+
+/**
+ * Record a change on this device. Folds it into an earlier unsent change where
+ * that's the same thing, so a burst of edits is one request, and a task made
+ * and deleted offline never reaches the server at all.
+ */
+function queue(op) {
+  op.id = op.id || rid('op');
+  op.at = op.at || new Date().toISOString();
+  const open = (o) => !o.sending && o.taskId === op.taskId;
+
+  if (op.type === 'delete') {
+    const created = local.outbox.find((o) => o.type === 'create' && o.taskId === op.taskId && !o.sending);
+    if (created) {
+      local.outbox = local.outbox.filter((o) => o.taskId !== op.taskId || o.sending);
+      return commitLocal();
+    }
+  }
+  if (op.type === 'update') {
+    const created = local.outbox.find((o) => o.type === 'create' && open(o));
+    if (created) {
+      Object.assign(created.task, clone(op.patch));
+      return commitLocal();
+    }
+    const last = [...local.outbox].reverse().find((o) => o.taskId === op.taskId);
+    if (last && last.type === 'update' && !last.sending) {
+      Object.assign(last.patch, clone(op.patch));
+      last.at = op.at;
+      return commitLocal();
+    }
+  }
+  local.outbox.push(op);
+  commitLocal();
+}
+function commitLocal() {
+  saveLocal();
+  redraw();
+  scheduleReminders(); // a new or moved due date is reminded about straight away, synced or not
+}
+
+/* ── talking to the server ── */
+
+async function sendOp(op) {
+  const opts = { background: true };
+  switch (op.type) {
+    case 'create': {
+      const t = op.task;
+      return api('/tasks', { ...opts, method: 'POST', body: {
+        id: t.id, projectId: t.projectId, title: t.title, details: t.details, checklist: t.checklist,
+        assigneeId: t.assigneeId, dueAt: t.dueAt, priority: t.priority, createdAt: t.createdAt,
+      } });
+    }
+    case 'update':
+      return api(`/tasks/${encodeURIComponent(op.taskId)}`, { ...opts, method: 'PATCH', body: op.patch });
+    case 'comment':
+      return api(`/tasks/${encodeURIComponent(op.taskId)}/comments`, { ...opts, method: 'POST', body: op.comment });
+    case 'complete':
+      return api(`/tasks/${encodeURIComponent(op.taskId)}/complete`, { ...opts, method: 'POST', body: {
+        historyId: op.history.id, completedAt: op.history.completedAt,
+      } });
+    case 'restore':
+      return api('/tasks/restore', { ...opts, method: 'POST', body: { task: op.task, historyId: op.historyId } });
+    case 'delete':
+      return api(`/tasks/${encodeURIComponent(op.taskId)}`, { ...opts, method: 'DELETE' });
+  }
+  return null;
+}
+
+const OP_LABEL = {
+  create: 'adding', update: 'editing', comment: 'a note on', complete: 'finishing', restore: 'putting back', delete: 'deleting',
+};
+function opTitle(op) {
+  return op.task?.title || op.history?.title || state.tasks.find((t) => t.id === op.taskId)?.title
+    || local.base?.tasks?.find((t) => t.id === op.taskId)?.title || 'a task';
+}
+
+/** Download a fresh copy of the boards, tasks and history. */
+async function pull({ background = true } = {}) {
+  const [{ projects }, { tasks }, { history }] = await Promise.all([
+    api('/projects', { background }),
+    api('/tasks', { background }),
+    api('/tasks/history/list', { background }),
+  ]);
+  local.base = {
+    projects,
+    tasks: tasks.map(rawTask),
+    history: history.map(({ completedBy, assignedTo, ...h }) => ({ ...h, completedBy, assignedTo })),
+  };
+  local.serverHasNews = false;
+  saveLocal();
+  redraw();
   noticeNewTasks();
   scheduleReminders();
+}
+
+/**
+ * Send everything waiting, then download. A change the server refuses (the
+ * task was finished or deleted by someone else, you were removed from the
+ * board) is dropped and reported; no connection stops the sync and keeps the
+ * rest for next time.
+ */
+function syncNow({ reason = 'manual' } = {}) {
+  if (!state.user) return Promise.resolve(null);
+  if (syncing) return syncing;
+  const btn = $('#refresh-btn');
+  btn?.classList.add('spinning');
+  setSyncNote(local.outbox.length ? `Sending ${local.outbox.length} change${local.outbox.length === 1 ? '' : 's'}…` : 'Checking for changes…');
+
+  syncing = (async () => {
+    const dropped = [];
+    let sent = 0;
+    while (local.outbox.length) {
+      const op = local.outbox[0];
+      op.sending = true;
+      try {
+        await sendOp(op);
+        sent++;
+      } catch (err) {
+        op.sending = false;
+        if (err.offline || err.auth || !err.status || err.status >= 500 || err.status === 429) { saveLocal(); throw err; }
+        // 404 on finishing or deleting means it is already gone — that's the goal reached.
+        const alreadyGone = err.status === 404 && (op.type === 'complete' || op.type === 'delete');
+        if (!alreadyGone) dropped.push(`${OP_LABEL[op.type] || 'changing'} “${opTitle(op)}”: ${err.message}`);
+      }
+      local.outbox = local.outbox.filter((o) => o !== op);
+      saveLocal();
+    }
+    await pull();
+    local.lastSyncAt = new Date().toISOString();
+    local.lastError = '';
+    saveLocal();
+    return { sent, dropped, reason };
+  })()
+    .catch((err) => { local.lastError = err.message; throw err; })
+    .finally(() => {
+      syncing = null;
+      setTimeout(() => btn?.classList.remove('spinning'), 350);
+      setSyncNote('');
+      updateSyncUi();
+    });
+  return syncing;
+}
+
+/** Sync and say how it went. For the button, pull-to-refresh, and Account. */
+async function syncAndReport() {
+  const before = $('#toast-text').textContent;
+  try {
+    const out = await syncNow({ reason: 'manual' });
+    if (!out) return;
+    if (out.dropped.length) {
+      toast(`Synced, but ${out.dropped.length} change${out.dropped.length === 1 ? '' : 's'} could not be applied — ${out.dropped[0]}`, null, 9000);
+      console.warn('[HomeBoard] changes the server refused:', out.dropped);
+      return;
+    }
+    // Don't talk over a "New task from…" alert the sync just raised.
+    if ($('#toast-text').textContent !== before && $('#toast').classList.contains('show')) return;
+    toast(out.sent ? `Synced — ${out.sent} change${out.sent === 1 ? '' : 's'} sent.` : 'Up to date.');
+  } catch (err) {
+    toast(err.offline
+      ? `Couldn't reach the server. ${pendingText()} — kept on this device.`
+      : err.message, null, 6000);
+  }
+}
+
+/** Safety-net syncs: quiet, and they never complain. */
+function autoSync(reason) {
+  syncNow({ reason }).then((out) => {
+    if (out?.dropped?.length) toast(`${out.dropped.length} change${out.dropped.length === 1 ? '' : 's'} could not be applied — ${out.dropped[0]}`, null, 9000);
+  }).catch(() => {});
+}
+
+const pendingText = () => `${local.outbox.length} change${local.outbox.length === 1 ? '' : 's'} waiting`;
+
+let syncNoteText = '';
+function setSyncNote(text) { syncNoteText = text; updateSyncUi(); }
+
+function updateSyncUi() {
+  const n = local.outbox.length;
+  const badge = $('#sync-badge');
+  if (badge) { badge.textContent = n > 99 ? '99+' : String(n); badge.classList.toggle('hidden', !n && !local.serverHasNews); badge.classList.toggle('dot-only', !n); }
+  const btn = $('#refresh-btn');
+  if (btn) btn.title = n ? `Sync now — ${pendingText()}` : 'Sync now';
+
+  const strip = $('#sync-strip');
+  if (strip) {
+    const show = Boolean(state.user) && (n > 0 || local.serverHasNews);
+    strip.classList.toggle('hidden', !show);
+    $('#sync-strip-text').textContent = syncNoteText ||
+      (n ? `${pendingText()} on this device — not on the server yet.` : 'There are new changes on the server.');
+  }
+
+  const status = $('#sync-status');
+  if (status) {
+    const parts = [];
+    parts.push(local.lastSyncAt ? `Last synced ${ago(local.lastSyncAt)}.` : 'Not synced yet on this device.');
+    parts.push(n ? `${pendingText()} to be sent.` : 'Nothing waiting to be sent.');
+    if (local.lastError) parts.push(`Last try failed: ${local.lastError}`);
+    if (syncNoteText) parts.push(syncNoteText);
+    status.textContent = parts.join(' ');
+  }
+}
+
+/* ── the safety net ── */
+
+let autoTimer = null;
+function startPolling() {
+  stopPolling();
+  const every = syncEvery();
+  if (every > 0) autoTimer = setInterval(() => autoSync('timer'), every * 60000);
+}
+function stopPolling() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!state.user || !syncOnEdges()) return;
+  if (document.visibilityState === 'visible') autoSync('open');
+  else if (local.outbox.length) autoSync('leave'); // get it off the phone before Android kills us
+});
+window.addEventListener('online', () => {
+  if (state.user && local.outbox.length && (syncEvery() > 0 || syncOnEdges())) autoSync('online');
+});
+window.addEventListener('offline', () => updateSyncUi());
+
+/* Board-level actions still need the server; afterwards, refresh the copy. */
+async function loadAll() { await pull({ background: false }); }
+
+/** A push says something changed on the server. */
+function serverChanged() {
+  local.serverHasNews = true;
+  updateSyncUi();
+  if (syncEvery() > 0 || syncOnEdges()) autoSync('push');
 }
 
 /* ───────────────────────── tabs ───────────────────────── */
@@ -572,9 +958,8 @@ function openTaskSheet(task = null) {
 
 $('#fab').addEventListener('click', () => openTaskSheet());
 
-$('#task-save').addEventListener('click', async () => {
+$('#task-save').addEventListener('click', () => {
   const form = $('#task-form');
-  const btn = $('#task-save');
   const title = form.elements.title.value.trim();
   if (title.length < 2) { form.elements.title.focus(); toast('Give the task a name.'); return; }
 
@@ -587,29 +972,36 @@ $('#task-save').addEventListener('click', async () => {
     dueAt: form.elements.dueAt.value ? new Date(form.elements.dueAt.value).toISOString() : null,
     assigneeId,
     priority,
-    checklist: state.draftChecks.filter((c) => c.text.trim()),
+    checklist: state.draftChecks
+      .filter((c) => c.text.trim())
+      .map((c) => ({ id: c.id || rid('chk'), text: c.text.trim().slice(0, 200), done: Boolean(c.done) })),
   };
 
-  btn.disabled = true;
-  const label = btn.textContent;
-  btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    if (state.editing) await api(`/tasks/${state.editing.id}`, { method: 'PATCH', body: payload });
-    else await api('/tasks', { method: 'POST', body: payload });
-    closeSheet();
-    await refreshTasks();
-    const who = activeProject().members.find((m) => m.user.id === assigneeId)?.user;
-    toast(
-      state.editing ? 'Task updated.'
-      : assigneeId === state.user.id ? 'Added to your list.'
-      : `Sent to ${who?.name?.split(' ')[0] || 'them'}.`
-    );
-  } catch (err) {
-    toast(err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = label;
+  // Saved on this device straight away; it reaches everyone else on the next sync.
+  const editing = state.editing;
+  if (editing) {
+    const patch = {};
+    for (const k of ['title', 'details', 'dueAt', 'assigneeId', 'priority', 'checklist']) {
+      if (JSON.stringify(payload[k] ?? null) !== JSON.stringify(editing[k] ?? null)) patch[k] = payload[k];
+    }
+    if (Object.keys(patch).length) queue({ type: 'update', taskId: editing.id, patch });
+  } else {
+    const now = new Date().toISOString();
+    const task = {
+      id: rid('tsk'), ...payload, title: title.slice(0, 120), details: payload.details.slice(0, 4000),
+      createdById: state.user.id, comments: [], createdAt: now, updatedAt: now,
+    };
+    markNotified(task.id); // you made it — no "new task" alert for it here
+    queue({ type: 'create', taskId: task.id, task });
   }
+  closeSheet();
+  const who = activeProject().members.find((m) => m.user.id === assigneeId)?.user;
+  toast(
+    editing ? 'Task updated.'
+    : assigneeId === state.user.id ? 'Added to your list.'
+    : `Saved for ${who?.name?.split(' ')[0] || 'them'} — they get it when you sync.`,
+    { label: 'Sync now', run: syncAndReport }
+  );
 });
 
 /* ───────────────────────── detail sheet ───────────────────────── */
@@ -677,13 +1069,9 @@ function renderDetail() {
     const btn = e.target.closest('.person');
     if (!btn || btn.getAttribute('aria-pressed') === 'true') return;
     $$('#detail-assignee .person').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
-    try {
-      await api(`/tasks/${task.id}`, { method: 'PATCH', body: { assigneeId: btn.dataset.uid } });
-      await refreshTasks();
-      renderDetail();
-      const who = activeProject().members.find((m) => m.user.id === btn.dataset.uid)?.user;
-      toast(btn.dataset.uid === state.user.id ? 'You took this on.' : `Passed to ${who?.name?.split(' ')[0]}.`);
-    } catch (err) { toast(err.message); }
+    queue({ type: 'update', taskId: task.id, patch: { assigneeId: btn.dataset.uid } });
+    const who = activeProject().members.find((m) => m.user.id === btn.dataset.uid)?.user;
+    toast(btn.dataset.uid === state.user.id ? 'You took this on.' : `Passed to ${who?.name?.split(' ')[0]}.`);
   });
 
   $('#detail-checks')?.addEventListener('change', async (e) => {
@@ -691,11 +1079,7 @@ function renderDetail() {
     const row = e.target.closest('.check');
     row.classList.toggle('done', e.target.checked);
     const next = steps.map((s) => (s.id === row.dataset.cid ? { ...s, done: e.target.checked } : s));
-    try {
-      await api(`/tasks/${task.id}`, { method: 'PATCH', body: { checklist: next } });
-      await refreshTasks();
-      renderDetail();
-    } catch (err) { toast(err.message); }
+    queue({ type: 'update', taskId: task.id, patch: { checklist: next } });
   });
 
   $('#note-form').addEventListener('submit', async (e) => {
@@ -704,11 +1088,7 @@ function renderDetail() {
     const text = input.value.trim();
     if (!text) return;
     input.value = '';
-    try {
-      await api(`/tasks/${task.id}/comments`, { method: 'POST', body: { text } });
-      await refreshTasks();
-      renderDetail();
-    } catch (err) { toast(err.message); }
+    queue({ type: 'comment', taskId: task.id, comment: { id: rid('cmt'), text: text.slice(0, 1000), at: new Date().toISOString() } });
   });
 }
 
@@ -735,36 +1115,39 @@ $('#detail-delete').addEventListener('click', async () => {
   const task = state.tasks.find((t) => t.id === state.detailId);
   if (!task) return;
   if (!confirm(`Delete “${task.title}”? It will not appear in Finished.`)) return;
-  try {
-    await api(`/tasks/${task.id}`, { method: 'DELETE' });
-    closeSheet();
-    await refreshTasks();
-    toast('Task deleted.');
-  } catch (err) { toast(err.message); }
+  closeSheet();
+  queue({ type: 'delete', taskId: task.id });
+  toast('Task deleted.');
 });
 
 async function completeTask(id, title) {
-  const card = $(`.task[data-id="${CSS.escape(id)}"]`);
-  if (card) card.classList.add('completing');
-  try {
-    const res = await api(`/tasks/${id}/complete`, { method: 'POST' });
-    await refreshTasks();
-    // The server hands the task back once and keeps no copy. If Undo isn't
-    // pressed before the toast goes, it really is gone.
-    toast(`“${title}” done.`, {
-      label: 'Undo',
-      run: async () => {
-        try {
-          await api('/tasks/restore', { method: 'POST', body: { task: res.undo, historyId: res.history?.id } });
-          await refreshTasks();
-          toast('Put back.');
-        } catch (err) { toast(err.message); }
-      },
-    });
-  } catch (err) {
-    card?.classList.remove('completing');
-    toast(err.message);
-  }
+  const task = state.tasks.find((t) => t.id === id);
+  if (!task) return;
+  // Kept in this closure only, for Undo. Once the toast goes, it really is gone.
+  const before = rawTask(clone(task));
+  const completedAt = new Date().toISOString();
+  const op = {
+    type: 'complete', taskId: id,
+    history: {
+      id: rid('hst'), projectId: task.projectId, title: task.title, completedById: state.user.id,
+      assignedToId: task.assigneeId || null, completedAt,
+      wasLate: task.dueAt ? Date.parse(completedAt) > Date.parse(task.dueAt) : false,
+    },
+  };
+  queue(op);
+  toast(`“${title}” done.`, {
+    label: 'Undo',
+    run: () => {
+      if (local.outbox.includes(op) && !op.sending) {
+        // Not sent yet — just forget it was ever done.
+        local.outbox = local.outbox.filter((o) => o !== op);
+        commitLocal();
+      } else {
+        queue({ type: 'restore', taskId: id, task: before, historyId: op.history.id });
+      }
+      toast('Put back.');
+    },
+  });
 }
 
 $('#view').addEventListener('click', (e) => {
@@ -956,6 +1339,10 @@ $('#theme-seg').addEventListener('click', (e) => {
 });
 
 $('#open-account').addEventListener('click', () => {
+  $('#sync-every').value = String(syncEvery());
+  $('#sync-edges').checked = syncOnEdges();
+  updateSyncUi();
+  updateBioUi();
   syncRemindersToggle();
   updatePushUi();
   if ($('#push-diag-wrap')?.open) renderPushDiagnostics();
@@ -968,7 +1355,18 @@ $('#open-account').addEventListener('click', () => {
 });
 
 $('#signout-btn').addEventListener('click', async () => {
+  if (local.outbox.length) {
+    if (confirm(`${pendingText()} on this device. Sync them before signing out?`)) {
+      try { await syncNow({ reason: 'signout' }); }
+      catch (err) {
+        if (!confirm(`Sync failed: ${err.message}\n\nSign out anyway? Unsynced changes on this device will be lost.`)) return;
+      }
+    } else if (!confirm('Sign out and throw those changes away?')) return;
+  }
   await disablePush();
+  forgetLocal();
+  bioOff();
+  appVisible = false;
   try { await api('/auth/signout', { method: 'POST' }); } catch { /* sign out locally anyway */ }
   setToken(null);
   state.user = null;
@@ -977,6 +1375,35 @@ $('#signout-btn').addEventListener('click', async () => {
   stopPolling();
   closeSheet();
   showAuth();
+});
+
+$('#sync-now-acct').addEventListener('click', () => syncAndReport());
+$('#sync-every').addEventListener('change', (e) => {
+  localStorage.setItem(SYNC_EVERY_KEY, e.target.value);
+  startPolling();
+  const m = Number(e.target.value);
+  toast(m ? `Syncing every ${m === 60 ? 'hour' : `${m} minutes`}.` : 'Sync is manual now — press the sync button when you want to.');
+});
+$('#sync-edges').addEventListener('change', (e) => {
+  localStorage.setItem(SYNC_EDGES_KEY, e.target.checked ? '1' : '0');
+});
+$('#export-local').addEventListener('click', () => {
+  const data = {
+    exportedAt: new Date().toISOString(),
+    user: { id: state.user.id, name: state.user.name, email: state.user.email },
+    lastSyncAt: local.lastSyncAt,
+    boards: state.projects.map((p) => ({ id: p.id, name: p.name })),
+    tasks: state.tasks.map(rawTask),
+    finished: state.history.map(({ completedBy, assignedTo, ...h }) => h),
+    unsyncedChanges: local.outbox,
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `homeboard-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
 /* ───────────────────────── PWA install ───────────────────────── */
@@ -1010,60 +1437,15 @@ if ('serviceWorker' in navigator) {
  * to reload. There is a refresh button, a pull-to-refresh, a refresh whenever
  * the app comes back to the foreground, and a quiet poll in between.
  */
-const POLL_MS = 20000;
-let pollTimer = null;
-let refreshing = false;
-
-async function refreshNow({ silent = false } = {}) {
-  if (refreshing || !state.user) return;
-  refreshing = true;
-  const btn = $('#refresh-btn');
-  if (!silent) btn?.classList.add('spinning');
-  try {
-    await loadAll();
-    if (openSheet === $('#sheet-detail') && state.detailId) renderDetail();
-    if (openSheet === $('#sheet-members')) renderMembers();
-    noticeNewTasks();
-    scheduleReminders();
-  } catch {
-    // A failed poll is not worth interrupting anyone over; the next one retries.
-  } finally {
-    refreshing = false;
-    if (!silent) setTimeout(() => btn?.classList.remove('spinning'), 350);
-  }
-}
-
-function startPolling() {
-  stopPolling();
-  let lastHidden = 0;
-  pollTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') { refreshNow({ silent: true }); return; }
-    // In the background, keep a slower watch for new tasks on devices that
-    // push can't reach — the only way they hear about one while not in front.
-    if (pushState !== 'on' && Date.now() - lastHidden > 60000) {
-      lastHidden = Date.now();
-      refreshNow({ silent: true });
-    }
-  }, POLL_MS);
-}
-function stopPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = null;
-}
-
-$('#refresh-btn').addEventListener('click', async () => {
-  const before = $('#toast-text').textContent;
-  await refreshNow();
-  // Don't talk over a "New task from…" alert the refresh just raised.
-  if ($('#toast-text').textContent === before || !$('#toast').classList.contains('show')) toast('Up to date.');
-});
+$('#refresh-btn').addEventListener('click', () => syncAndReport());
+$('#sync-strip-btn')?.addEventListener('click', () => syncAndReport());
 
 /* Pull down at the top of the list to refresh. */
 (function pullToRefresh() {
   const main = document.querySelector('main');
   const indicator = document.createElement('div');
   indicator.className = 'pull';
-  indicator.textContent = 'Pull to refresh';
+  indicator.textContent = 'Pull to sync';
   main.prepend(indicator);
 
   const THRESHOLD = 68;
@@ -1084,7 +1466,7 @@ $('#refresh-btn').addEventListener('click', async () => {
     indicator.style.height = `${h}px`;
     const armed = h >= THRESHOLD * 0.45;
     indicator.classList.toggle('armed', armed);
-    indicator.textContent = armed ? 'Release to refresh' : 'Pull to refresh';
+    indicator.textContent = armed ? 'Release to sync' : 'Pull to sync';
   }, { passive: true });
 
   const end = async () => {
@@ -1093,7 +1475,7 @@ $('#refresh-btn').addEventListener('click', async () => {
     const armed = indicator.classList.contains('armed');
     indicator.style.height = '0px';
     indicator.classList.remove('armed');
-    if (armed) { await refreshNow(); toast('Up to date.'); }
+    if (armed) await syncAndReport();
   };
   main.addEventListener('touchend', end);
   main.addEventListener('touchcancel', end);
@@ -1589,7 +1971,7 @@ function setupNativeListeners(pn) {
   pn.addListener('pushNotificationReceived', (n) => {
     const d = n?.data || {};
     if (d.taskId) markNotified(d.taskId);
-    refreshNow({ silent: true });
+    serverChanged();
     showLocal({ id: d.taskId, title: n.title || 'New task', body: n.body || '' });
   });
 
@@ -1767,7 +2149,7 @@ async function openTaskFromPush(taskId) {
   if (!taskId) return;
   // Tapped with the app killed: this fires before sign-in has finished.
   if (!state.user || !state.projects.length) { pendingOpenTaskId = taskId; return; }
-  if (!state.tasks.some((t) => t.id === taskId)) { try { await loadAll(); } catch {} }
+  if (!state.tasks.some((t) => t.id === taskId)) { try { await syncNow({ reason: 'open-task' }); } catch {} }
   const task = state.tasks.find((t) => t.id === taskId);
   if (!task) { toast('That task is no longer on the board.'); return; }
   if (task.projectId !== state.activeId) { state.activeId = task.projectId; localStorage.setItem('hb.board', task.projectId); render(); }
@@ -1875,7 +2257,7 @@ $('#push-diag-wrap')?.addEventListener('toggle', (e) => { if (e.target.open) ren
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (e) => {
     const msg = e.data || {};
-    if (msg.type === 'hb-push') { if (msg.data?.taskId) markNotified(msg.data.taskId); refreshNow({ silent: true }); }
+    if (msg.type === 'hb-push') { if (msg.data?.taskId) markNotified(msg.data.taskId); serverChanged(); }
     else if (msg.type === 'hb-open-task') openTaskFromPush(msg.taskId);
     else if (msg.type === 'hb-resubscribe') enablePush({ ask: false });
   });
@@ -1970,6 +2352,9 @@ $('#delete-account').addEventListener('click', async () => {
   if (!confirm('Last check — this is permanent. Delete the account?')) return;
   try {
     const out = await api('/auth/me', { method: 'DELETE' });
+    forgetLocal();
+    bioOff();
+    appVisible = false;
     setToken(null);
     state.user = null;
     state.projects = [];
@@ -2008,16 +2393,258 @@ $('#delete-account').addEventListener('click', async () => {
   });
 })();
 
+/* ───────────────────────── fingerprint unlock ───────────────────────── */
+
+/*
+ * Sign in with the password once; after that, a fingerprint opens HomeBoard.
+ *
+ *   APK      Android's own BiometricPrompt, via @capgo/capacitor-native-biometric.
+ *   Browser  WebAuthn with the phone's built-in authenticator (fingerprint, face,
+ *            or the screen lock as fallback) — Chrome on Android, Safari on iPhone.
+ *
+ * The fingerprint never leaves the phone and the server never sees it. What it
+ * unlocks is the session already on this device; each unlock also swaps that
+ * session for a fresh 30-day one, so as long as HomeBoard is opened once a
+ * month the password is not needed again. Signing out ends the session, so the
+ * next sign-in needs the password and fingerprint is turned on again after.
+ */
+const BIO_KEY = 'hb.bio';                 // { userId, kind: 'native' | 'web', credId? }
+const BIO_DISMISSED = 'hb.bioDismissed';
+const LOCK_AFTER_MS = 5 * 60 * 1000;      // back from the background after this long → lock again
+const nativeBio = () => cap()?.NativeBiometric || null;
+
+function bioSaved() { try { return JSON.parse(localStorage.getItem(BIO_KEY) || 'null'); } catch { return null; } }
+const bioOnFor = (userId) => Boolean(userId) && bioSaved()?.userId === userId;
+
+/** 'native' | 'web' | null */
+async function bioAvailable() {
+  const nb = nativeBio();
+  if (nb) {
+    try { return (await nb.isAvailable())?.isAvailable ? 'native' : null; } catch { return null; }
+  }
+  if (window.PublicKeyCredential?.isUserVerifyingPlatformAuthenticatorAvailable && window.isSecureContext) {
+    try { return (await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()) ? 'web' : null; } catch { return null; }
+  }
+  return null;
+}
+
+function randomBytes(n) {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return b;
+}
+
+/** Ask for the fingerprint. Resolves when it matched; throws otherwise. */
+async function bioCheck(saved, reason) {
+  if (saved?.kind === 'native') {
+    const nb = nativeBio();
+    if (!nb) throw new Error('This build cannot read fingerprints.');
+    await nb.verifyIdentity({
+      reason, title: 'HomeBoard', subtitle: reason, description: '',
+      negativeButtonText: 'Use password', maxAttempts: 5,
+    });
+    return;
+  }
+  if (saved?.kind === 'web') {
+    const cred = await navigator.credentials.get({
+      publicKey: {
+        challenge: randomBytes(32),
+        allowCredentials: [{ type: 'public-key', id: b64ToBytes(saved.credId), transports: ['internal'] }],
+        userVerification: 'required',
+        timeout: 60000,
+      },
+    });
+    if (!cred) throw new Error('Not recognised.');
+    // Byte 32 of authenticatorData is the flags; 0x04 = the user was verified
+    // (fingerprint / face / screen lock), not just present.
+    const flags = new Uint8Array(cred.response.authenticatorData)[32];
+    if (!(flags & 0x04)) throw new Error('Your phone did not confirm it was you.');
+    return;
+  }
+  throw new Error('Fingerprint unlock is not set up on this device.');
+}
+
+async function bioEnroll() {
+  const kind = await bioAvailable();
+  if (!kind) throw new Error('This device has no fingerprint (or screen lock) HomeBoard can use.');
+  if (kind === 'native') {
+    await bioCheck({ kind }, 'Confirm to open HomeBoard with your fingerprint');
+    localStorage.setItem(BIO_KEY, JSON.stringify({ userId: state.user.id, kind }));
+    return;
+  }
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: randomBytes(32),
+      rp: { name: 'HomeBoard' },
+      user: {
+        id: new TextEncoder().encode(state.user.id),
+        name: state.user.email || state.user.name,
+        displayName: state.user.name || state.user.email,
+      },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
+      timeout: 60000,
+      attestation: 'none',
+    },
+  });
+  if (!cred) throw new Error('Fingerprint setup was cancelled.');
+  localStorage.setItem(BIO_KEY, JSON.stringify({ userId: state.user.id, kind, credId: bytesToB64(cred.rawId) }));
+}
+
+function bioOff() { localStorage.removeItem(BIO_KEY); }
+
+// Android BiometricPrompt: 10 = cancelled by the person, 13 = "Use password" tapped, 16 = cancelled.
+const bioCancelled = (err) =>
+  err?.name === 'NotAllowedError' || err?.name === 'AbortError' ||
+  ['10', '13', '16'].includes(String(err?.code ?? '')) || /cancel/i.test(String(err?.message ?? ''));
+
+function bioErrorText(err) {
+  if (bioCancelled(err)) return '';
+  return err?.message || 'Fingerprint not recognised.';
+}
+
+/** Keep the session rolling: a fresh 30 days from every unlock. */
+function refreshSession() {
+  api('/auth/refresh', { method: 'POST', background: true })
+    .then((d) => { if (d?.token) setToken(d.token); })
+    .catch(() => { /* offline — the current one is still good */ });
+}
+
+/* ── the lock screen ── */
+
+let unlockWaiter = null;
+let appVisible = false;
+
+function waitForUnlock(user) {
+  $('#auth-screen').classList.add('hidden');
+  $('#app-screen').classList.add('hidden');
+  closeSheet();
+  $('#lock-hello').textContent = `Welcome back${user?.name ? `, ${user.name.split(/\s+/)[0]}` : ''}`;
+  $('#lock-sub').textContent = bioSaved()?.kind === 'web'
+    ? 'Use your fingerprint (or screen lock) to open HomeBoard.'
+    : 'Touch the fingerprint sensor to open HomeBoard.';
+  $('#lock-alert').classList.add('hidden');
+  $('#lock-screen').classList.remove('hidden');
+  return new Promise((resolve) => {
+    unlockWaiter = resolve;
+    tryUnlock({ auto: true });
+  });
+}
+
+async function tryUnlock({ auto = false } = {}) {
+  const btn = $('#lock-unlock');
+  if (btn.classList.contains('busy')) return;
+  btn.classList.add('busy');
+  $('#lock-alert').classList.add('hidden');
+  try {
+    await bioCheck(bioSaved(), 'Open HomeBoard');
+    $('#lock-screen').classList.add('hidden');
+    if (appVisible) $('#app-screen').classList.remove('hidden');
+    const done = unlockWaiter;
+    unlockWaiter = null;
+    refreshSession();
+    done?.();
+  } catch (err) {
+    // A browser may refuse a prompt that didn't come from a tap — that's what
+    // the big button is for, so an automatic first try fails quietly.
+    const text = auto ? '' : bioErrorText(err);
+    if (text) {
+      $('#lock-alert').textContent = `${text} Try again, or use your password.`;
+      $('#lock-alert').classList.remove('hidden');
+    }
+  } finally {
+    btn.classList.remove('busy');
+  }
+}
+
+$('#lock-unlock').addEventListener('click', () => tryUnlock());
+$('#lock-password').addEventListener('click', () => {
+  // The session stays locked; the password starts a new one. The copy on the
+  // device is kept, so unsynced changes are still there after signing in.
+  const email = bioSaved() && state.user?.email;
+  unlockWaiter = null;
+  setToken(null);
+  stopPolling();
+  appVisible = false;
+  state.user = null;
+  $('#lock-screen').classList.add('hidden');
+  setAuthMode('signin');
+  if (email) $('#auth-form [name=email]').value = email;
+  showAuth();
+});
+
+/* Lock again after a while in the background. */
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+  if (state.user && appVisible && bioOnFor(state.user.id) && !unlockWaiter
+      && hiddenAt && Date.now() - hiddenAt > LOCK_AFTER_MS) {
+    waitForUnlock(state.user);
+  }
+});
+
+/* ── turning it on ── */
+
+async function updateBioUi() {
+  const kind = await bioAvailable();
+  const on = bioOnFor(state.user?.id);
+  $('#bio-block')?.classList.toggle('hidden', !kind && !on);
+  const toggle = $('#bio-toggle');
+  if (toggle) toggle.checked = on;
+  const note = $('#bio-note');
+  if (note) {
+    note.textContent = kind === 'web'
+      ? 'Your fingerprint (or this phone\'s screen lock) opens HomeBoard instead of your password. It stays on this phone — the server never sees it. Signing out turns it off.'
+      : 'Your fingerprint opens HomeBoard instead of your password. It stays on this phone — the server never sees it. Signing out turns it off.';
+  }
+  const banner = $('#bio-banner');
+  if (banner) banner.classList.toggle('hidden', !(kind && !on && !localStorage.getItem(BIO_DISMISSED)));
+}
+
+async function turnBioOn() {
+  try {
+    await bioEnroll();
+    toast('Done — next time, just use your fingerprint.');
+  } catch (err) {
+    bioOff();
+    const text = bioErrorText(err);
+    if (text) toast(text, null, 6000);
+  }
+  updateBioUi();
+}
+
+$('#bio-toggle').addEventListener('change', (e) => {
+  if (e.target.checked) turnBioOn();
+  else { bioOff(); toast('Fingerprint unlock off. You will need your password after signing out.'); updateBioUi(); }
+});
+$('#bio-banner-on').addEventListener('click', () => turnBioOn());
+$('#bio-banner-dismiss').addEventListener('click', () => {
+  localStorage.setItem(BIO_DISMISSED, '1');
+  $('#bio-banner').classList.add('hidden');
+});
+
 /* ───────────────────────── boot ───────────────────────── */
 
 async function boot() {
   if (!state.user?.id) { showAuth(); return; }
   $('#auth-screen').classList.add('hidden');
+  $('#lock-screen').classList.add('hidden');
   $('#app-screen').classList.remove('hidden');
+  appVisible = true;
+  updateBioUi();
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
   $('#my-avatar').textContent = initials(state.user.name);
   await syncRemindersToggle();
-  await loadAll();
+  // Draw from the copy on this device first — instant, and works with no signal.
+  loadLocal();
+  rebuild();
+  render();
+  updateSyncUi();
+  if (!local.base) {
+    await syncNow({ reason: 'first' });        // nothing here yet: we need one download
+  } else if (syncOnEdges()) {
+    autoSync('open');
+  }
   noticeNewTasks();
   await consumePendingJoin();
   scheduleReminders();
@@ -2046,6 +2673,20 @@ async function boot() {
     }
     setAuthMode('signin'); showAuth(); return;
   }
+  // Signed in before on this device: open straight from the local copy, then
+  // check the session in the background. Only a real "signed out" (401) ends it.
+  let cached = null;
+  try { cached = JSON.parse(localStorage.getItem('hb.user') || 'null'); } catch {}
+  if (cached?.id) {
+    state.user = cached;
+    if (bioOnFor(cached.id)) await waitForUnlock(cached);
+    try { await boot(); } catch (err) { toast(err.offline ? 'Offline — showing what is on this device.' : err.message); }
+    api('/auth/me', { background: true })
+      .then(({ user }) => { if (user?.id && state.user?.id === user.id) { state.user = user; saveLocal(); } })
+      .catch(() => {});
+    handleJoinLink();
+    return;
+  }
   try {
     const { user } = await api('/auth/me');
     if (!user?.id) throw new Error('no account returned');
@@ -2067,8 +2708,4 @@ async function boot() {
   }
 })();
 
-// Pull fresh data when the app comes back to the foreground.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.user) refreshNow({ silent: true });
-});
 })();

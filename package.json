@@ -18,7 +18,9 @@
     "test:android": "node scripts/android-sim.js",
     "test:qr": "node scripts/qr-test.js",
     "test:reminders": "node scripts/reminders-test.js",
-    "test:push": "node scripts/push-test.js"
+    "test:push": "node scripts/push-test.js",
+    "test:sync": "node scripts/sync-test.js",
+    "test:fingerprint": "node scripts/fingerprint-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -37,6 +39,7 @@
     "@capacitor/cli": "^6.2.0",
     "@capacitor/core": "^6.2.0",
     "@capacitor/local-notifications": "^6.1.0",
-    "@capacitor/push-notifications": "^6.0.5"
+    "@capacitor/push-notifications": "^6.0.5",
+    "@capgo/capacitor-native-biometric": "^6.0.4"
   }
 }

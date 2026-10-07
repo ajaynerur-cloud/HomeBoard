@@ -23,9 +23,13 @@ const EXTRA = [
   ['android.permission.POST_NOTIFICATIONS', 'showing a reminder at all on Android 13+'],
   ['android.permission.RECEIVE_BOOT_COMPLETED', 'reminders surviving a restart'],
   ['android.permission.VIBRATE', 'the reminder buzzing'],
+  ['android.permission.USE_BIOMETRIC', 'unlocking HomeBoard with a fingerprint'],
 ];
 
-const REQUIRED_PLUGINS = ['@capacitor/local-notifications', '@capacitor/app', '@capacitor/push-notifications'];
+const REQUIRED_PLUGINS = [
+  '@capacitor/local-notifications', '@capacitor/app', '@capacitor/push-notifications',
+  '@capgo/capacitor-native-biometric', // fingerprint unlock
+];
 const GOOGLE_SERVICES = path.join(ROOT, 'app', 'google-services.json');
 const PUSH_CHANNEL_ID = 'homeboard-tasks';
 

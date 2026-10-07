@@ -64,6 +64,23 @@
   </div>
 </div>
 
+<!-- ============ LOCK (fingerprint) ============ -->
+<div id="lock-screen" class="hidden">
+  <div class="auth-card lock-card">
+    <div class="brand">
+      <img src="/icons/icon-192.png" alt="" width="62" height="62">
+      <h1 id="lock-hello">Welcome back</h1>
+      <p id="lock-sub">Touch the sensor to open HomeBoard.</p>
+    </div>
+    <div id="lock-alert" class="alert alert-error hidden" role="alert"></div>
+    <button type="button" class="fp-btn" id="lock-unlock" aria-label="Unlock with fingerprint">
+      <svg width="54" height="54" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 11c0 3.5-1 6.5-2.5 9"/><path d="M8.6 7.6A4.5 4.5 0 0 1 16.5 11c0 1.8-.2 3.6-.6 5.3"/><path d="M5.2 15.5c.5-1.4.8-2.9.8-4.5a6 6 0 0 1 1.1-3.5"/><path d="M14.4 20.5c.3-.9.6-1.9.8-2.9"/><path d="M3.5 11a8.5 8.5 0 0 1 15.4-5"/><path d="M20.4 9.5c.1.5.1 1 .1 1.5 0 1.4-.1 2.7-.3 4"/><path d="M12 11c0 2.6-.6 5-1.6 7.2"/></svg>
+      <span>Unlock with fingerprint</span>
+    </button>
+    <button type="button" class="btn btn-ghost btn-block" id="lock-password">Use my password instead</button>
+  </div>
+</div>
+
 <!-- ============ APP ============ -->
 <div id="app-screen" class="hidden">
   <header class="topbar">
@@ -72,7 +89,8 @@
       <span class="nm" id="board-name">Loading…</span>
       <svg width="12" height="8" viewBox="0 0 12 8" fill="none" aria-hidden="true"><path d="M1 1l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
-    <button class="btn btn-ghost btn-sm" id="refresh-btn" title="Check for changes">
+    <button class="btn btn-ghost btn-sm" id="refresh-btn" title="Sync now" aria-label="Sync now">
+      <span class="sync-badge hidden" id="sync-badge" aria-hidden="true">0</span>
       <svg id="refresh-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6M3 22v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L21 8M21 15a9 9 0 0 1-14.9 3.4L3 16"/></svg>
     </button>
     <button class="btn btn-ghost btn-sm" id="open-members" title="People on this board">
@@ -91,11 +109,21 @@
   </nav>
 
   <main>
+    <div id="sync-strip" class="sync-strip hidden" role="status">
+      <span id="sync-strip-text">Changes waiting on this device.</span>
+      <button type="button" class="btn btn-primary btn-sm" id="sync-strip-btn">Sync now</button>
+    </div>
     <div id="install-banner" class="install hidden">
       <img src="/icons/icon-192.png" alt="" width="34" height="34" style="border-radius:9px">
       <p><strong>Add HomeBoard to your home screen</strong><br>Runs full-screen, works offline.</p>
       <button class="btn btn-primary btn-sm" id="install-btn">Install</button>
       <button class="btn btn-ghost btn-sm" id="install-dismiss" aria-label="Dismiss">✕</button>
+    </div>
+    <div id="bio-banner" class="install hidden" role="status">
+      <span class="fp-chip"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 11c0 3.5-1 6.5-2.5 9"/><path d="M8.6 7.6A4.5 4.5 0 0 1 16.5 11c0 1.8-.2 3.6-.6 5.3"/><path d="M5.2 15.5c.5-1.4.8-2.9.8-4.5a6 6 0 0 1 1.1-3.5"/><path d="M14.4 20.5c.3-.9.6-1.9.8-2.9"/><path d="M3.5 11a8.5 8.5 0 0 1 15.4-5"/><path d="M20.4 9.5c.1.5.1 1 .1 1.5 0 1.4-.1 2.7-.3 4"/><path d="M12 11c0 2.6-.6 5-1.6 7.2"/></svg></span>
+      <p><strong>Open with your fingerprint</strong><br>Skip the password on this phone.</p>
+      <button class="btn btn-primary btn-sm" id="bio-banner-on">Turn on</button>
+      <button class="btn btn-ghost btn-sm" id="bio-banner-dismiss" aria-label="Dismiss">✕</button>
     </div>
     <div id="push-banner" class="install hidden" role="status">
       <img src="/icons/icon-192.png" alt="" width="34" height="34" style="border-radius:9px">
@@ -293,6 +321,47 @@
         <button type="button" data-v="light" aria-pressed="false">Light</button>
         <button type="button" data-v="dark" aria-pressed="false">Dark</button>
       </div>
+    </div>
+    <div class="detail-block hidden" id="bio-block">
+      <h4>Fingerprint</h4>
+      <label class="switch">
+        <input type="checkbox" id="bio-toggle">
+        <span>
+          <strong>Unlock HomeBoard with my fingerprint</strong>
+          <em id="bio-note">Instead of your password, every time you open the app on this device.</em>
+        </span>
+      </label>
+    </div>
+    <div class="detail-block">
+      <h4>Sync</h4>
+      <p class="hint" id="sync-status" style="margin:0 0 10px">Not synced yet on this device.</p>
+      <button type="button" class="btn btn-primary btn-sm" id="sync-now-acct">Sync now</button>
+      <label class="field" style="margin-top:16px">
+        <span>Sync automatically</span>
+        <select class="select" id="sync-every">
+          <option value="0">Never — only when I press Sync</option>
+          <option value="5">Every 5 minutes</option>
+          <option value="15" selected>Every 15 minutes</option>
+          <option value="30">Every 30 minutes</option>
+          <option value="60">Every hour</option>
+        </select>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="sync-edges" checked>
+        <span>
+          <strong>Also sync when I open or leave HomeBoard</strong>
+          <em>A safety net, so changes don't sit on this phone if you forget. Turn both off for fully manual sync.</em>
+        </span>
+      </label>
+      <details class="help" style="margin-top:12px">
+        <summary>How sync works</summary>
+        <p>Everything you do is saved on this device first, instantly, with or without signal. Sync sends
+        your changes to the server, then fetches everyone else's. Until you sync, other people on the board
+        don't see your changes — and you don't see theirs.</p>
+        <p>If someone else finished or deleted a task you changed offline, your change to it is dropped and
+        you're told which one.</p>
+        <p><button type="button" class="btn btn-sm" id="export-local">Save a copy of my data (JSON)</button></p>
+      </details>
     </div>
     <div class="detail-block">
       <h4>New tasks</h4>
