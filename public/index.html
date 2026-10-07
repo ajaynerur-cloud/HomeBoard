@@ -36,6 +36,15 @@
 
     <div id="auth-alert" class="alert alert-error hidden" role="alert"></div>
 
+    <div id="bio-signin" class="bio-signin hidden">
+      <button type="button" class="fp-btn" id="bio-signin-btn">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 11c0 3.5-1 6.5-2.5 9"/><path d="M8.6 7.6A4.5 4.5 0 0 1 16.5 11c0 1.8-.2 3.6-.6 5.3"/><path d="M5.2 15.5c.5-1.4.8-2.9.8-4.5a6 6 0 0 1 1.1-3.5"/><path d="M14.4 20.5c.3-.9.6-1.9.8-2.9"/><path d="M3.5 11a8.5 8.5 0 0 1 15.4-5"/><path d="M20.4 9.5c.1.5.1 1 .1 1.5 0 1.4-.1 2.7-.3 4"/><path d="M12 11c0 2.6-.6 5-1.6 7.2"/></svg>
+        <span>Sign in with fingerprint</span>
+      </button>
+      <p class="bio-who" id="bio-signin-who"></p>
+      <div class="or"><span>or use your password</span></div>
+    </div>
+
     <form id="auth-form" novalidate>
       <label class="field" id="name-field" hidden>
         <span>Your name</span>
@@ -322,7 +331,7 @@
         <button type="button" data-v="dark" aria-pressed="false">Dark</button>
       </div>
     </div>
-    <div class="detail-block hidden" id="bio-block">
+    <div class="detail-block" id="bio-block">
       <h4>Fingerprint</h4>
       <label class="switch">
         <input type="checkbox" id="bio-toggle">

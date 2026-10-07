@@ -74,23 +74,29 @@ What you see is always *last download + your unsent changes*, so a download neve
 - Account → *How sync works* → **Save a copy of my data (JSON)** exports the local copy.
 - Signing out with unsynced changes offers to sync first.
 
-## Fingerprint unlock
+## Fingerprint sign-in
 
-After a password sign-in, the board shows **Open with your fingerprint** (also in Account).
+Sign in with your password once, then **Account → Fingerprint** (or the banner on the board).
+After that the fingerprint is all you need:
+
+- **Opening the app** — a lock screen asks for the fingerprint (again after 5 minutes in the background).
+- **Sign-in screen** — after signing out, or when a session has run out, **Sign in with fingerprint**
+  sits above the password form. In the APK the prompt comes up by itself.
+- **Use my password instead** is always there.
 
 | Where | How |
 |---|---|
-| The APK | Android's BiometricPrompt via `@capgo/capacitor-native-biometric` |
-| Phone browser / installed PWA | WebAuthn with the built-in authenticator (fingerprint, face, or screen lock) |
+| The APK | Android's fingerprint prompt via `@capgo/capacitor-native-biometric` — **rebuild the APK** |
+| Phone browser / installed PWA | WebAuthn with the built-in authenticator (needs https) |
 
-Every time the app opens — and when it comes back after 5 minutes in the background — it shows a
-lock screen and asks for the fingerprint. **Use my password instead** is always there. The
-fingerprint stays on the phone; it unlocks the session already on the device, and each unlock calls
-`POST /api/auth/refresh` for a fresh 30-day session, so the password isn't needed again as long as
-the app is opened once a month. Signing out ends the session and turns fingerprint off.
+Turning it on gives the phone a **device key** (`POST /api/auth/device`); the server keeps only its
+SHA-256. The phone uses the key only after the fingerprint matches, and swaps it for a session
+(`POST /api/auth/device/signin`). The fingerprint never leaves the phone. Turning it off deletes the
+key on the server (`DELETE /api/auth/device/:id`); deleting the account deletes all its keys.
+Keys live in `devices.json` in the data repo.
 
-Rebuild the APK to get it (the plugin is in `devDependencies`, and `patch-android-manifest.js`
-now checks it registered and adds `USE_BIOMETRIC`). Browser fingerprint needs HTTPS (Render gives you that).
+If the switch won't stay on, the line under it now says why — no fingerprint enrolled on the phone,
+an APK built before the plugin was added, a browser that can't do it, or the prompt was closed.
 
 ## The two repos
 
@@ -98,7 +104,7 @@ This is the part worth understanding before you start.
 
 ```
   homeboard              PUBLIC    the code in this folder
-  homeboard-data         PRIVATE   users.json, projects.json, tasks.json, history.json, push.json
+  homeboard-data         PRIVATE   users.json, projects.json, tasks.json, history.json, push.json, devices.json
 ```
 
 The server never stores anything on disk in production. Every write is a commit
@@ -457,7 +463,10 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/auth/signin` | sign in |
 | `POST` | `/auth/signout` | clear the cookie |
 | `GET` | `/auth/me` | current user |
-| `POST` | `/auth/refresh` | a fresh 30-day token (after a fingerprint unlock) |
+| `POST` | `/auth/refresh` | a fresh 30-day token |
+| `POST` | `/auth/device` | turn fingerprint on for this phone — returns a device key |
+| `POST` | `/auth/device/signin` | fingerprint sign-in: device key → session |
+| `DELETE` | `/auth/device/:id` | turn fingerprint off for that phone |
 | `GET` | `/projects` | boards you're on |
 | `POST` | `/projects` | create a board |
 | `PATCH` | `/projects/:id` | rename (owner) |

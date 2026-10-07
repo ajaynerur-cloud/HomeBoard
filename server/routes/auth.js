@@ -7,6 +7,7 @@ const {
   clearAuthCookie, requireAuth, publicUser, pickColor,
 } = require('../auth');
 const push = require('../push');
+const crypto = require('crypto');
 
 const router = express.Router();
 
@@ -110,6 +111,86 @@ router.post('/refresh', requireAuth, (req, res) => {
   res.json({ token, user: publicUser(req.user) });
 });
 
+/*
+ * Fingerprint sign-in.
+ *
+ * Turning fingerprint on gives this phone a device key: a random secret the
+ * phone keeps and only hands over after the fingerprint matches. The server
+ * stores a SHA-256 of it, never the secret. Signing in with the fingerprint
+ * swaps the key for a session — so it works from the sign-in screen, after
+ * signing out, and after a session has expired. Turning fingerprint off (or
+ * deleting the account) removes the key and it stops working everywhere.
+ */
+const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+const MAX_DEVICES_PER_USER = 10;
+
+router.post('/device', requireAuth, async (req, res, next) => {
+  try {
+    const secret = crypto.randomBytes(32).toString('base64url');
+    const device = {
+      id: newId('dev'),
+      userId: req.user.id,
+      secretHash: sha256(secret),
+      label: String(req.body?.label || '').slice(0, 80),
+      createdAt: new Date().toISOString(),
+      lastUsedAt: null,
+    };
+    await store.update('devices', (rows) => {
+      // Re-enrolling on the same phone replaces its old key.
+      const replaces = String(req.body?.replaces || '');
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i].userId === req.user.id && rows[i].id === replaces) rows.splice(i, 1);
+      }
+      rows.push(device);
+      const mine = rows.filter((d) => d.userId === req.user.id);
+      if (mine.length > MAX_DEVICES_PER_USER) {
+        const oldest = mine.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))[0];
+        rows.splice(rows.findIndex((d) => d.id === oldest.id), 1);
+      }
+    }, 'HomeBoard: fingerprint sign-in turned on for a device');
+    res.status(201).json({ deviceId: device.id, secret });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/device/signin', loginLimiter, async (req, res, next) => {
+  try {
+    const id = String(req.body?.deviceId || '');
+    const hash = sha256(req.body?.secret || '');
+    const device = (await store.read('devices')).find((d) => d.id === id);
+    const ok = device && crypto.timingSafeEqual(Buffer.from(device.secretHash, 'hex'), Buffer.from(hash, 'hex'));
+    const user = ok && (await store.read('users')).find((u) => u.id === device.userId);
+    if (!user) {
+      return res.status(401).json({
+        error: 'Fingerprint sign-in is no longer set up for this phone. Sign in with your password, then turn it on again.',
+        deviceGone: true,
+      });
+    }
+    store.update('devices', (rows) => {
+      const d = rows.find((x) => x.id === id);
+      if (d) d.lastUsedAt = new Date().toISOString();
+    }, 'HomeBoard: fingerprint sign-in').catch(() => {});
+    const token = signToken(user);
+    setAuthCookie(res, token);
+    res.json({ token, user: publicUser(user) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete('/device/:id', requireAuth, async (req, res, next) => {
+  try {
+    await store.update('devices', (rows) => {
+      const i = rows.findIndex((d) => d.id === req.params.id && d.userId === req.user.id);
+      if (i !== -1) rows.splice(i, 1);
+    }, 'HomeBoard: fingerprint sign-in turned off for a device');
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /**
  * Delete the account and everything tied to it.
  *
@@ -156,6 +237,10 @@ router.delete('/me', requireAuth, async (req, res, next) => {
     }, 'HomeBoard: account deleted — history cleared');
 
     await push.removeUser(me);
+
+    await store.update('devices', (rows) => {
+      for (let i = rows.length - 1; i >= 0; i--) if (rows[i].userId === me) rows.splice(i, 1);
+    }, 'HomeBoard: account deleted — fingerprint keys removed');
 
     await store.update('users', (rows) => {
       const i = rows.findIndex((u) => u.id === me);

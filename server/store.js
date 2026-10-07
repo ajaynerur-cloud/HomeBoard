@@ -20,7 +20,7 @@
 const fs = require('fs/promises');
 const path = require('path');
 
-const COLLECTIONS = ['users', 'projects', 'tasks', 'history', 'push'];
+const COLLECTIONS = ['users', 'projects', 'tasks', 'history', 'push', 'devices'];
 
 const TOKEN = process.env.GITHUB_TOKEN || '';
 const REPO = process.env.DATA_REPO || '';

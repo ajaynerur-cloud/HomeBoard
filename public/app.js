@@ -270,6 +270,7 @@ function setAuthMode(mode) {
       ? 'Got a join code from someone? Create your account, then enter the code on the next screen.'
       : 'New here? Create an account — it takes a few seconds.';
   $('#auth-alert').classList.add('hidden');
+  updateBioSignin?.();
 }
 
 /* Show / hide the password. Worth having: a mistyped password on a phone
@@ -1365,7 +1366,6 @@ $('#signout-btn').addEventListener('click', async () => {
   }
   await disablePush();
   forgetLocal();
-  bioOff();
   appVisible = false;
   try { await api('/auth/signout', { method: 'POST' }); } catch { /* sign out locally anyway */ }
   setToken(null);
@@ -1374,6 +1374,7 @@ $('#signout-btn').addEventListener('click', async () => {
   state.tasks = [];
   stopPolling();
   closeSheet();
+  setAuthMode('signin');
   showAuth();
 });
 
@@ -2353,7 +2354,7 @@ $('#delete-account').addEventListener('click', async () => {
   try {
     const out = await api('/auth/me', { method: 'DELETE' });
     forgetLocal();
-    bioOff();
+    bioOff({ server: false }); // the server already removed this account's keys
     appVisible = false;
     setToken(null);
     state.user = null;
@@ -2393,39 +2394,64 @@ $('#delete-account').addEventListener('click', async () => {
   });
 })();
 
-/* ───────────────────────── fingerprint unlock ───────────────────────── */
+/* ───────────────────────── fingerprint ───────────────────────── */
 
 /*
- * Sign in with the password once; after that, a fingerprint opens HomeBoard.
+ * Sign in with the password once, turn fingerprint on, and from then on the
+ * fingerprint is enough — on the lock screen when HomeBoard opens, and on the
+ * sign-in screen after signing out or when a session has run out.
  *
- *   APK      Android's own BiometricPrompt, via @capgo/capacitor-native-biometric.
- *   Browser  WebAuthn with the phone's built-in authenticator (fingerprint, face,
- *            or the screen lock as fallback) — Chrome on Android, Safari on iPhone.
+ *   APK      Android's own fingerprint prompt (@capgo/capacitor-native-biometric).
+ *   Browser  WebAuthn with the phone's built-in authenticator (fingerprint,
+ *            face, or screen lock) — Chrome on Android, Safari on iPhone.
  *
- * The fingerprint never leaves the phone and the server never sees it. What it
- * unlocks is the session already on this device; each unlock also swaps that
- * session for a fresh 30-day one, so as long as HomeBoard is opened once a
- * month the password is not needed again. Signing out ends the session, so the
- * next sign-in needs the password and fingerprint is turned on again after.
+ * Turning it on gives this phone a device key from the server. The phone only
+ * uses that key after the fingerprint matches, and swaps it for a session. The
+ * fingerprint itself never leaves the phone. Turning it off deletes the key on
+ * the server, so it stops working even if the phone is lost.
  */
-const BIO_KEY = 'hb.bio';                 // { userId, kind: 'native' | 'web', credId? }
+const BIO_KEY = 'hb.bio';   // { userId, email, name, kind, credId?, deviceId, secret }
 const BIO_DISMISSED = 'hb.bioDismissed';
-const LOCK_AFTER_MS = 5 * 60 * 1000;      // back from the background after this long → lock again
+const LOCK_AFTER_MS = 5 * 60 * 1000;
 const nativeBio = () => cap()?.NativeBiometric || null;
+const inApk = () => Boolean(window.Capacitor?.isNativePlatform?.()) || isNativeApp();
 
 function bioSaved() { try { return JSON.parse(localStorage.getItem(BIO_KEY) || 'null'); } catch { return null; } }
 const bioOnFor = (userId) => Boolean(userId) && bioSaved()?.userId === userId;
 
-/** 'native' | 'web' | null */
-async function bioAvailable() {
+const NATIVE_UNAVAILABLE = {
+  1: 'This phone has no fingerprint sensor HomeBoard can use.',
+  2: 'Fingerprint is locked on this phone after too many tries. Unlock the phone with your PIN, then try again.',
+  3: 'No fingerprint is set up on this phone. Add one in Android Settings → Security → Fingerprint, then come back.',
+  4: 'Too many tries — fingerprint is paused for a moment. Try again shortly.',
+  14: 'This phone has no screen lock. Set a PIN and a fingerprint in Android Settings first.',
+};
+
+/** { kind: 'native' | 'web' | null, reason } — reason says why not, in plain words. */
+async function bioStatus() {
   const nb = nativeBio();
   if (nb) {
-    try { return (await nb.isAvailable())?.isAvailable ? 'native' : null; } catch { return null; }
+    try {
+      const r = await nb.isAvailable();
+      if (r?.isAvailable) return { kind: 'native', reason: '' };
+      return { kind: null, reason: NATIVE_UNAVAILABLE[r?.errorCode] || 'Android says fingerprint is not available on this phone right now.' };
+    } catch (err) {
+      return { kind: null, reason: `Could not check the fingerprint sensor (${err?.message || err}).` };
+    }
   }
-  if (window.PublicKeyCredential?.isUserVerifyingPlatformAuthenticatorAvailable && window.isSecureContext) {
-    try { return (await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()) ? 'web' : null; } catch { return null; }
+  // Inside the APK the WebView can't do browser fingerprint (WebAuthn), so
+  // without the plugin there is nothing to use — say so rather than try.
+  if (inApk()) {
+    return { kind: null, reason: 'This copy of the app was built without fingerprint support. Re-run "Build Android APK" on GitHub and reinstall it.' };
   }
-  return null;
+  if (!window.isSecureContext) return { kind: null, reason: 'Fingerprint needs HomeBoard to be opened over https.' };
+  if (!window.PublicKeyCredential?.isUserVerifyingPlatformAuthenticatorAvailable) {
+    return { kind: null, reason: 'This browser cannot use the phone\'s fingerprint. Try Chrome on Android or Safari on iPhone.' };
+  }
+  try {
+    if (await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()) return { kind: 'web', reason: '' };
+  } catch { /* fall through */ }
+  return { kind: null, reason: 'No fingerprint or screen lock is set up on this device.' };
 }
 
 function randomBytes(n) {
@@ -2434,83 +2460,102 @@ function randomBytes(n) {
   return b;
 }
 
-/** Ask for the fingerprint. Resolves when it matched; throws otherwise. */
-async function bioCheck(saved, reason) {
-  if (saved?.kind === 'native') {
-    const nb = nativeBio();
-    if (!nb) throw new Error('This build cannot read fingerprints.');
-    await nb.verifyIdentity({
-      reason, title: 'HomeBoard', subtitle: reason, description: '',
-      negativeButtonText: 'Use password', maxAttempts: 5,
-    });
-    return;
+/* Errors from the prompt, in plain words. `cancelled` = the person closed it. */
+function bioError(err) {
+  const code = String(err?.code ?? '');
+  if (code === '16' || code === '15' || err?.name === 'AbortError') return { cancelled: true, text: 'The fingerprint prompt was closed.' };
+  if (err?.name === 'NotAllowedError') {
+    return { cancelled: true, text: 'The fingerprint prompt was closed or timed out. If no prompt appeared, check that a fingerprint and screen lock are set up on this phone.' };
   }
-  if (saved?.kind === 'web') {
-    const cred = await navigator.credentials.get({
+  if (code === '10') return { cancelled: false, text: 'Fingerprint not recognised.' };
+  if (NATIVE_UNAVAILABLE[code]) return { cancelled: false, text: NATIVE_UNAVAILABLE[code] };
+  if (err?.name === 'InvalidStateError') return { cancelled: false, text: 'This phone already has a HomeBoard fingerprint key. Turn it off and on again.' };
+  if (err?.name === 'SecurityError') return { cancelled: false, text: 'The browser blocked fingerprint for this address (it needs https).' };
+  return { cancelled: false, text: err?.message ? `Fingerprint failed: ${err.message}${code ? ` (code ${code})` : ''}` : 'Fingerprint failed.' };
+}
+
+/** Ask for the fingerprint. Resolves when it matched; throws otherwise. */
+async function bioCheck(kind, credId, reason) {
+  if (kind === 'native') {
+    const nb = nativeBio();
+    if (!nb) throw new Error('This copy of the app has no fingerprint support.');
+    await nb.verifyIdentity({ reason, title: 'HomeBoard', subtitle: reason, negativeButtonText: 'Cancel', maxAttempts: 5 });
+    return null;
+  }
+  if (kind === 'web') {
+    const publicKey = credId
+      ? {
+          challenge: randomBytes(32),
+          allowCredentials: [{ type: 'public-key', id: b64ToBytes(credId), transports: ['internal'] }],
+          userVerification: 'required',
+          timeout: 60000,
+        }
+      : null;
+    if (publicKey) {
+      const cred = await navigator.credentials.get({ publicKey });
+      if (!cred) throw new Error('Not recognised.');
+      // Flags byte: 0x04 = the person was verified (finger/face/screen lock), not just present.
+      if (!(new Uint8Array(cred.response.authenticatorData)[32] & 0x04)) throw new Error('Your phone did not confirm it was you.');
+      return null;
+    }
+    // First time: make this phone's key. Creating it already needs the finger.
+    const cred = await navigator.credentials.create({
       publicKey: {
         challenge: randomBytes(32),
-        allowCredentials: [{ type: 'public-key', id: b64ToBytes(saved.credId), transports: ['internal'] }],
-        userVerification: 'required',
+        rp: { name: 'HomeBoard' },
+        user: {
+          id: new TextEncoder().encode(state.user.id),
+          name: state.user.email || state.user.name,
+          displayName: state.user.name || state.user.email,
+        },
+        pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+        authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
         timeout: 60000,
+        attestation: 'none',
       },
     });
-    if (!cred) throw new Error('Not recognised.');
-    // Byte 32 of authenticatorData is the flags; 0x04 = the user was verified
-    // (fingerprint / face / screen lock), not just present.
-    const flags = new Uint8Array(cred.response.authenticatorData)[32];
-    if (!(flags & 0x04)) throw new Error('Your phone did not confirm it was you.');
-    return;
+    if (!cred) throw new Error('Fingerprint setup was cancelled.');
+    return bytesToB64(cred.rawId);
   }
-  throw new Error('Fingerprint unlock is not set up on this device.');
+  throw new Error('Fingerprint is not set up on this device.');
 }
 
 async function bioEnroll() {
-  const kind = await bioAvailable();
-  if (!kind) throw new Error('This device has no fingerprint (or screen lock) HomeBoard can use.');
-  if (kind === 'native') {
-    await bioCheck({ kind }, 'Confirm to open HomeBoard with your fingerprint');
-    localStorage.setItem(BIO_KEY, JSON.stringify({ userId: state.user.id, kind }));
-    return;
-  }
-  const cred = await navigator.credentials.create({
-    publicKey: {
-      challenge: randomBytes(32),
-      rp: { name: 'HomeBoard' },
-      user: {
-        id: new TextEncoder().encode(state.user.id),
-        name: state.user.email || state.user.name,
-        displayName: state.user.name || state.user.email,
-      },
-      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
-      authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
-      timeout: 60000,
-      attestation: 'none',
-    },
+  const { kind, reason } = await bioStatus();
+  if (!kind) throw new Error(reason);
+  const credId = await bioCheck(kind, null, 'Confirm to sign in with your fingerprint');
+  const old = bioSaved();
+  const { deviceId, secret } = await api('/auth/device', {
+    method: 'POST',
+    body: { label: navigator.userAgent.slice(0, 80), replaces: old?.userId === state.user.id ? old.deviceId : undefined },
   });
-  if (!cred) throw new Error('Fingerprint setup was cancelled.');
-  localStorage.setItem(BIO_KEY, JSON.stringify({ userId: state.user.id, kind, credId: bytesToB64(cred.rawId) }));
+  localStorage.setItem(BIO_KEY, JSON.stringify({
+    userId: state.user.id, email: state.user.email, name: state.user.name,
+    kind, credId: credId || null, deviceId, secret,
+  }));
 }
 
-function bioOff() { localStorage.removeItem(BIO_KEY); }
-
-// Android BiometricPrompt: 10 = cancelled by the person, 13 = "Use password" tapped, 16 = cancelled.
-const bioCancelled = (err) =>
-  err?.name === 'NotAllowedError' || err?.name === 'AbortError' ||
-  ['10', '13', '16'].includes(String(err?.code ?? '')) || /cancel/i.test(String(err?.message ?? ''));
-
-function bioErrorText(err) {
-  if (bioCancelled(err)) return '';
-  return err?.message || 'Fingerprint not recognised.';
+function bioOff({ server = true } = {}) {
+  const saved = bioSaved();
+  localStorage.removeItem(BIO_KEY);
+  if (server && saved?.deviceId && getToken()) {
+    api(`/auth/device/${encodeURIComponent(saved.deviceId)}`, { method: 'DELETE', background: true }).catch(() => {});
+  }
 }
 
-/** Keep the session rolling: a fresh 30 days from every unlock. */
-function refreshSession() {
-  api('/auth/refresh', { method: 'POST', background: true })
-    .then((d) => { if (d?.token) setToken(d.token); })
-    .catch(() => { /* offline — the current one is still good */ });
+/** Swap the device key for a fresh session. */
+async function bioSession(saved, { background = false } = {}) {
+  try {
+    const out = await api('/auth/device/signin', { method: 'POST', background, body: { deviceId: saved.deviceId, secret: saved.secret } });
+    if (out?.token) setToken(out.token);
+    return out;
+  } catch (err) {
+    if (err.status === 401) { bioOff({ server: false }); updateBioUi(); }
+    throw err;
+  }
 }
 
-/* ── the lock screen ── */
+/* ── lock screen: there is a session on the phone; the finger opens it ── */
 
 let unlockWaiter = null;
 let appVisible = false;
@@ -2536,20 +2581,22 @@ async function tryUnlock({ auto = false } = {}) {
   if (btn.classList.contains('busy')) return;
   btn.classList.add('busy');
   $('#lock-alert').classList.add('hidden');
+  const saved = bioSaved();
   try {
-    await bioCheck(bioSaved(), 'Open HomeBoard');
+    await bioCheck(saved?.kind, saved?.credId, 'Open HomeBoard');
     $('#lock-screen').classList.add('hidden');
     if (appVisible) $('#app-screen').classList.remove('hidden');
     const done = unlockWaiter;
     unlockWaiter = null;
-    refreshSession();
+    // A fresh session from the device key — so an old one never runs out.
+    if (saved?.deviceId) bioSession(saved, { background: true }).catch(() => {});
     done?.();
   } catch (err) {
+    const e = bioError(err);
     // A browser may refuse a prompt that didn't come from a tap — that's what
-    // the big button is for, so an automatic first try fails quietly.
-    const text = auto ? '' : bioErrorText(err);
-    if (text) {
-      $('#lock-alert').textContent = `${text} Try again, or use your password.`;
+    // the big button is for, so a cancelled automatic first try stays quiet.
+    if (!(auto && e.cancelled)) {
+      $('#lock-alert').textContent = `${e.text} Tap the fingerprint to try again, or use your password.`;
       $('#lock-alert').classList.remove('hidden');
     }
   } finally {
@@ -2559,9 +2606,7 @@ async function tryUnlock({ auto = false } = {}) {
 
 $('#lock-unlock').addEventListener('click', () => tryUnlock());
 $('#lock-password').addEventListener('click', () => {
-  // The session stays locked; the password starts a new one. The copy on the
-  // device is kept, so unsynced changes are still there after signing in.
-  const email = bioSaved() && state.user?.email;
+  const email = state.user?.email;
   unlockWaiter = null;
   setToken(null);
   stopPolling();
@@ -2573,7 +2618,6 @@ $('#lock-password').addEventListener('click', () => {
   showAuth();
 });
 
-/* Lock again after a while in the background. */
 let hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
@@ -2583,45 +2627,102 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-/* ── turning it on ── */
+/* ── sign-in screen: no session; the finger signs in ── */
+
+function updateBioSignin() {
+  const saved = bioSaved();
+  const box = $('#bio-signin');
+  if (!box) return;
+  const show = Boolean(saved?.deviceId) && authMode === 'signin';
+  box.classList.toggle('hidden', !show);
+  if (show) $('#bio-signin-who').textContent = saved.name ? `${saved.name} · ${saved.email || ''}` : (saved.email || '');
+}
+
+async function bioSignin({ auto = false } = {}) {
+  const saved = bioSaved();
+  if (!saved?.deviceId) return;
+  const btn = $('#bio-signin-btn');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const alert = $('#auth-alert');
+  alert.classList.add('hidden');
+  try {
+    await bioCheck(saved.kind, saved.credId, 'Sign in to HomeBoard');
+    const out = await bioSession(saved);
+    if (!out?.user?.id) throw new Error('The server did not send an account back.');
+    state.user = out.user;
+    await boot();
+    handleJoinLink();
+  } catch (err) {
+    const e = err.status || err.offline ? { cancelled: false, text: err.message } : bioError(err);
+    if (!(auto && e.cancelled)) {
+      alert.textContent = e.text;
+      alert.className = 'alert alert-error';
+      alert.classList.remove('hidden');
+    }
+    updateBioSignin();
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('#bio-signin-btn').addEventListener('click', () => bioSignin());
+
+/* ── turning it on and off ── */
 
 async function updateBioUi() {
-  const kind = await bioAvailable();
+  const { kind, reason } = await bioStatus();
   const on = bioOnFor(state.user?.id);
-  $('#bio-block')?.classList.toggle('hidden', !kind && !on);
   const toggle = $('#bio-toggle');
-  if (toggle) toggle.checked = on;
+  if (toggle && !toggle.dataset.busy) {
+    toggle.checked = on;
+    toggle.disabled = !kind && !on;
+  }
   const note = $('#bio-note');
   if (note) {
-    note.textContent = kind === 'web'
-      ? 'Your fingerprint (or this phone\'s screen lock) opens HomeBoard instead of your password. It stays on this phone — the server never sees it. Signing out turns it off.'
-      : 'Your fingerprint opens HomeBoard instead of your password. It stays on this phone — the server never sees it. Signing out turns it off.';
+    note.textContent = !kind && !on ? reason
+      : on ? 'On. Your fingerprint opens HomeBoard and signs you in — no password. The fingerprint stays on this phone.'
+      : 'Sign in and open HomeBoard with your fingerprint instead of your password. The fingerprint stays on this phone.';
   }
   const banner = $('#bio-banner');
   if (banner) banner.classList.toggle('hidden', !(kind && !on && !localStorage.getItem(BIO_DISMISSED)));
+  updateBioSignin();
 }
 
 async function turnBioOn() {
+  const toggle = $('#bio-toggle');
+  toggle.dataset.busy = '1';
+  toggle.checked = true;
   try {
     await bioEnroll();
-    toast('Done — next time, just use your fingerprint.');
+    toast('Fingerprint is on. Next time, just use your finger.');
   } catch (err) {
-    bioOff();
-    const text = bioErrorText(err);
-    if (text) toast(text, null, 6000);
+    const e = err.status || err.offline ? { text: err.message } : bioError(err);
+    toast(`Fingerprint not turned on — ${e.text}`, null, 8000);
+  } finally {
+    delete toggle.dataset.busy;
+    updateBioUi();
   }
-  updateBioUi();
 }
 
 $('#bio-toggle').addEventListener('change', (e) => {
   if (e.target.checked) turnBioOn();
-  else { bioOff(); toast('Fingerprint unlock off. You will need your password after signing out.'); updateBioUi(); }
+  else { bioOff(); toast('Fingerprint is off on this phone.'); updateBioUi(); }
 });
 $('#bio-banner-on').addEventListener('click', () => turnBioOn());
 $('#bio-banner-dismiss').addEventListener('click', () => {
   localStorage.setItem(BIO_DISMISSED, '1');
   $('#bio-banner').classList.add('hidden');
 });
+
+/* Turned on by the previous version (no device key yet): get one quietly. */
+async function upgradeBioKey() {
+  const saved = bioSaved();
+  if (!saved || saved.deviceId || saved.userId !== state.user?.id) return;
+  try {
+    const { deviceId, secret } = await api('/auth/device', { method: 'POST', background: true, body: {} });
+    localStorage.setItem(BIO_KEY, JSON.stringify({ ...saved, email: state.user.email, name: state.user.name, deviceId, secret }));
+  } catch { /* next time */ }
+}
 
 /* ───────────────────────── boot ───────────────────────── */
 
@@ -2632,6 +2733,7 @@ async function boot() {
   $('#app-screen').classList.remove('hidden');
   appVisible = true;
   updateBioUi();
+  upgradeBioKey();
   $('#my-avatar').style.background = state.user.avatarColor || '#0f766e';
   $('#my-avatar').textContent = initials(state.user.name);
   await syncRemindersToggle();
@@ -2671,7 +2773,9 @@ async function boot() {
       showAuth();
       return;
     }
-    setAuthMode('signin'); showAuth(); return;
+    setAuthMode('signin'); showAuth();
+    if (bioSaved()?.deviceId) bioSignin({ auto: true });
+    return;
   }
   // Signed in before on this device: open straight from the local copy, then
   // check the session in the background. Only a real "signed out" (401) ends it.

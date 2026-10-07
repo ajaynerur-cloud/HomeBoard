@@ -21,12 +21,13 @@ const AUTO_NOT_NOW = `
 // Behaves like the native plugin. window.__bio = 'ok' | 'cancel' | 'fail'
 const NATIVE_STUB = `
   window.__bio = 'ok'; window.__bioCalls = 0;
-  window.Capacitor = { Plugins: { NativeBiometric: {
-    isAvailable: async () => ({ isAvailable: true, biometryType: 3 }),
+  window.Capacitor = { isNativePlatform: () => true, Plugins: { NativeBiometric: {
+    isAvailable: async () => window.__noFinger ? ({ isAvailable: false, errorCode: 3 }) : ({ isAvailable: true, biometryType: 3 }),
     verifyIdentity: async () => {
       window.__bioCalls++;
-      if (window.__bio === 'cancel') throw Object.assign(new Error('User canceled'), { code: '13' });
-      if (window.__bio === 'fail') throw Object.assign(new Error('Too many attempts.'), { code: '7' });
+      // Codes as @capgo/capacitor-native-biometric 6 sends them.
+      if (window.__bio === 'cancel') throw Object.assign(new Error('Cancel'), { code: '16' });
+      if (window.__bio === 'fail') throw Object.assign(new Error('Authentication failed.'), { code: '10' });
     },
   } } };
 `;
@@ -110,16 +111,30 @@ async function signUp(p, email, name) {
   await p.waitForSelector('#app-screen:not(.hidden)');
   check('and the password still works', true);
 
-  // Signing out turns it off.
+  // Signed out: the sign-in screen offers the fingerprint, and it signs in.
   await cdp.send('WebAuthn.setUserVerified', { authenticatorId, isUserVerified: true });
   p.on('dialog', (d) => d.accept());
   await p.click('#open-account');
   await p.click('#signout-btn');
+  await p.waitForTimeout(1200);
+  check('after signing out, the sign-in screen shows "Sign in with fingerprint"', await visible(p, '#bio-signin'));
+  check('with who it is for', (await p.textContent('#bio-signin-who')).includes(`fp.${s}@demo.com`));
+  if (await visible(p, '#auth-screen') && !(await visible(p, '#app-screen'))) await p.click('#bio-signin-btn');
+  await p.waitForSelector('#app-screen:not(.hidden)', { timeout: 8000 });
+  check('the fingerprint signs in — no password typed', true);
+  check('with a real session', Boolean(await p.evaluate(() => localStorage.getItem('hb.token'))));
+
+  // Turning it off removes the key on the server too.
+  const key = await p.evaluate(() => JSON.parse(localStorage.getItem('hb.bio')));
+  await p.click('#open-account');
+  await p.uncheck('#bio-toggle');
+  await p.waitForTimeout(1200);
+  const r = await fetch(`${BASE}/api/auth/device/signin`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: key.deviceId, secret: key.secret }) });
+  check('turning it off stops the key working on the server', r.status === 401, String(r.status));
+  await p.click('#signout-btn');
   await p.waitForTimeout(800);
-  check('signing out clears fingerprint unlock', await p.evaluate(() => localStorage.getItem('hb.bio')) === null);
-  await p.reload();
-  await p.waitForTimeout(800);
-  check('so the next open asks for the password', await visible(p, '#auth-screen') && !(await visible(p, '#lock-screen')));
+  check('and the sign-in screen no longer offers it', !(await visible(p, '#bio-signin')));
 
   /* ── APK: native plugin ── */
   console.log('\nFingerprint — Android app (native plugin stood in for)\n');
@@ -153,6 +168,42 @@ async function signUp(p, email, name) {
   await a.click('#lock-unlock');
   await a.waitForSelector('#app-screen:not(.hidden)', { timeout: 5000 });
   check('then the finger opens it', true);
+
+  // A finger the server must accept: sign out and back in with it.
+  a.on('dialog', (d) => d.accept());
+  await a.click('#open-account');
+  await a.click('#signout-btn');
+  await a.waitForTimeout(800);
+  check('in the APK, signing out shows the sign-in screen with the fingerprint button',
+        await visible(a, '#auth-screen') && await visible(a, '#bio-signin'));
+  await a.addInitScript(() => { if (sessionStorage.getItem('bioOk')) window.__bio = 'ok'; });
+  await a.evaluate(() => sessionStorage.setItem('bioOk', '1'));
+  await a.reload();   // opening the app: the fingerprint prompt comes up by itself
+  await a.waitForSelector('#app-screen:not(.hidden)', { timeout: 8000 });
+  check('in the APK, signing out and opening again signs straight back in with the finger', true);
+
+  // No fingerprint enrolled on the phone: say why, don't flick the switch.
+  const ctx3 = await b.newContext({ viewport: { width: 430, height: 932 } });
+  await ctx3.addInitScript(AUTO_NOT_NOW);
+  await ctx3.addInitScript(NATIVE_STUB);
+  await ctx3.addInitScript(() => { window.__noFinger = true; });
+  const c = await ctx3.newPage();
+  c.on('pageerror', (e) => errs.push(e.message));
+  await signUp(c, `fpc.${s}@demo.com`, 'No Finger');
+  await c.click('#open-account');
+  await c.waitForTimeout(400);
+  check('no fingerprint on the phone: the switch is greyed out', await c.isDisabled('#bio-toggle'));
+  check('and it says how to fix it', /Settings/.test(await c.textContent('#bio-note')), await c.textContent('#bio-note'));
+
+  // An APK built without the plugin.
+  const ctx4 = await b.newContext({ viewport: { width: 430, height: 932 } });
+  await ctx4.addInitScript(AUTO_NOT_NOW);
+  await ctx4.addInitScript(() => { window.Capacitor = { isNativePlatform: () => true, Plugins: {} }; });
+  const d4 = await ctx4.newPage();
+  await signUp(d4, `fpd.${s}@demo.com`, 'Old Build');
+  await d4.click('#open-account');
+  await d4.waitForTimeout(400);
+  check('an APK without the plugin says to rebuild', /Build Android APK/.test(await d4.textContent('#bio-note')), await d4.textContent('#bio-note'));
 
   check('no page errors', errs.length === 0, errs.join(' | '));
   await b.close();
