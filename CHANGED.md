@@ -57,3 +57,14 @@ Files this round: `public/app.js`, `public/index.html`, `public/app.css`, `publi
 
 **You must rebuild the APK** (Actions → Build Android APK) and reinstall — an APK built before the
 fingerprint plugin was added cannot read fingerprints, and Account → Fingerprint will now say so.
+
+## Round 3 — don't wake Render at sign-in
+
+- **Fingerprint** and **a password this phone already knows** sign in on the phone and open the board
+  straight away; the server session is fetched afterwards in the background. No waking screen.
+- First download on a new phone runs behind a *Fetching your boards…* placeholder.
+- Notification setup and sign-out no longer show the waking screen.
+- With fingerprint on, signing out keeps the local copy on the phone.
+
+Files this round: `public/app.js`, `public/sw.js` (v8), `package.json`, `scripts/login-test.js` (new, 16),
+`README.md`, `CHANGED.md`. No server change; no APK rebuild needed beyond round 2's.

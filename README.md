@@ -74,7 +74,25 @@ What you see is always *last download + your unsent changes*, so a download neve
 - Account → *How sync works* → **Save a copy of my data (JSON)** exports the local copy.
 - Signing out with unsynced changes offers to sync first.
 
-## Fingerprint sign-in
+## Signing in never waits for the server
+
+A sleeping Render host is woken **after** you're in, not in front of you:
+
+| How you sign in | What happens |
+|---|---|
+| Fingerprint (sign-in screen or lock screen) | Checked on the phone; the board opens from the local copy at once. |
+| Password this phone has seen work before | Checked on the phone (a PBKDF2 hash kept on the device, never the password); the board opens at once. |
+| First sign-in on a new phone, or a new password | Has to ask the server — the only case that shows the waking screen. |
+
+Straight after, the app fetches its server session in the background (no waking screen — the
+sync button spins). Syncs wait for it. A first download on a new phone also runs behind a
+*Fetching your boards…* placeholder instead of blocking. If the password was changed on another
+device, the background check signs this phone out and asks for the new one.
+
+With fingerprint on, signing out keeps the local copy on the phone (it's behind the fingerprint);
+without it, signing out clears it.
+
+
 
 Sign in with your password once, then **Account → Fingerprint** (or the banner on the board).
 After that the fingerprint is all you need:
@@ -432,6 +450,7 @@ npm run test:reminders  # the Android reminder flow against a stand-in plugin �
                      # and exact alarms disallowed
 npm run test:sync    # offline-first: offline edits, offline reopen, manual sync, conflicts
 npm run test:fingerprint  # WebAuthn virtual authenticator + stand-in native plugin
+npm run test:login   # sign-in with the API playing dead: no waiting, no waking screen
 npm run test:ui      # 45 real browser assertions through the whole UI
                      # (needs: npm i --no-save playwright && npx playwright install chromium)
 ```

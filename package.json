@@ -20,7 +20,8 @@
     "test:reminders": "node scripts/reminders-test.js",
     "test:push": "node scripts/push-test.js",
     "test:sync": "node scripts/sync-test.js",
-    "test:fingerprint": "node scripts/fingerprint-test.js"
+    "test:fingerprint": "node scripts/fingerprint-test.js",
+    "test:login": "node scripts/login-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

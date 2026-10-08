@@ -54,10 +54,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 function apiError(message, extra) { return Object.assign(new Error(message), extra); }
 
-async function api(path, { method = 'GET', body, background = false } = {}) {
+async function api(path, { method = 'GET', body, background = false, noSession = false } = {}) {
   if (navigator.onLine === false) {
     throw apiError('You are offline. Your changes are kept on this device until you sync.', { offline: true });
   }
+  // Signed in on the phone only (fingerprint or remembered password): get the
+  // server session now, the first time something actually needs the server.
+  if (!noSession) await ensureSession();
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const token = getToken();
@@ -125,7 +128,7 @@ async function api(path, { method = 'GET', body, background = false } = {}) {
     let data = {};
     try { data = await res.json(); } catch { /* an empty body is fine */ }
 
-    if (res.status === 401 && state.user) {
+    if (res.status === 401 && state.user && !noSession) {
       setToken(null);
       state.user = null;
       showAuth();
@@ -134,6 +137,58 @@ async function api(path, { method = 'GET', body, background = false } = {}) {
     if (!res.ok) throw apiError(data.error || `Something went wrong (${res.status}).`, { status: res.status });
     return data;
   }
+}
+
+/*
+ * Signing in never waits for the server.
+ *
+ * A fingerprint, or a password this phone has seen work before, signs you in
+ * on the phone and opens the board from the local copy straight away. The
+ * server session is fetched afterwards, quietly — just after sign-in, or the
+ * first time a sync needs it — so a sleeping Render host is woken *after* you
+ * are in, never in front of you.
+ */
+let sessionGetter = null;   // async () => void — fetches and stores a token
+let sessionPromise = null;
+
+async function ensureSession() {
+  if (getToken() || !sessionGetter) return;
+  if (!sessionPromise) {
+    sessionPromise = sessionGetter().finally(() => { sessionPromise = null; });
+  }
+  await sessionPromise;
+}
+
+/** After a local sign-in: fetch the session in the background, never blocking. */
+function sessionInBackground() {
+  ensureSession().catch((err) => {
+    if (err?.status === 401) return; // handled where the credential is
+    /* offline or asleep — the next sync tries again */
+  });
+}
+
+/* Password check on the phone: PBKDF2, never the password itself. */
+const PW_KEY = 'hb.pw';
+const PW_ITER = 210000;
+const enc = (s) => new TextEncoder().encode(s);
+async function pwHash(password, salt) {
+  const key = await crypto.subtle.importKey('raw', enc(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: b64ToBytes(salt), iterations: PW_ITER }, key, 256);
+  return bytesToB64(bits);
+}
+function pwSaved() { try { return JSON.parse(localStorage.getItem(PW_KEY) || 'null'); } catch { return null; } }
+async function rememberPassword(email, password, user) {
+  if (!crypto?.subtle) return;
+  try {
+    const salt = bytesToB64(crypto.getRandomValues(new Uint8Array(16)));
+    localStorage.setItem(PW_KEY, JSON.stringify({ email: String(email).trim().toLowerCase(), salt, hash: await pwHash(password, salt), user }));
+  } catch { /* no local sign-in next time; the server still works */ }
+}
+/** The user, if this phone recognises this email + password; otherwise null. */
+async function localPasswordCheck(email, password) {
+  const saved = pwSaved();
+  if (!saved || !crypto?.subtle || saved.email !== String(email).trim().toLowerCase()) return null;
+  try { return (await pwHash(password, saved.salt)) === saved.hash ? saved.user : null; } catch { return null; }
 }
 
 /* The waking screen — ours, not the host's. */
@@ -307,12 +362,38 @@ $('#auth-form').addEventListener('submit', async (e) => {
   alert.classList.add('hidden');
 
   try {
+    // Seen this password work on this phone before? Sign in here and now; the
+    // server is asked afterwards, in the background.
+    const known = authMode === 'signin' && await localPasswordCheck(payload.email, payload.password);
+    if (known?.id) {
+      setToken(null);
+      state.user = known;
+      sessionGetter = async () => {
+        try {
+          const data = await api('/auth/signin', { method: 'POST', body: payload, background: true, noSession: true });
+          if (data?.token) { setToken(data.token); if (state.user?.id === data.user?.id) { state.user = data.user; saveLocal(); } }
+          sessionGetter = bioOnFor(state.user?.id) ? bioGetter() : null; // don't keep the password around
+        } catch (err) {
+          if (err.status === 401) {
+            // Changed on another device — this phone's copy of it is out of date.
+            localStorage.removeItem(PW_KEY);
+            sessionGetter = null;
+            signOutHere('Your password was changed. Sign in with the new one.');
+          }
+          throw err;
+        }
+      };
+      await boot();
+      sessionInBackground();
+      return;
+    }
     const data = await api(`/auth/${authMode}`, { method: 'POST', body: payload });
     if (!data?.token || !data?.user?.id) {
       throw new Error('The server replied but did not send an account back. Check that the app is pointed at your HomeBoard server.');
     }
     setToken(data.token);
     state.user = data.user;
+    rememberPassword(payload.email, payload.password, data.user);
     await boot();
   } catch (err) {
     alert.textContent = err.message;
@@ -373,6 +454,15 @@ const emptyState = (title, body) => `
 
 function render() {
   const project = activeProject();
+  if (!project && !local.base && state.user) {
+    // First time on this phone: the boards are on their way, in the background.
+    $('#board-name').textContent = 'HomeBoard';
+    $('#view').innerHTML = local.lastError
+      ? emptyState('Could not fetch your boards yet', `${local.lastError} Tap the sync button to try again.`)
+      : `<div class="center-load"><span class="spinner"></span><p style="color:var(--ink-3);font-size:13px;margin-top:10px">Fetching your boards…</p></div>`;
+    $$('.tabs .count').forEach((c) => (c.textContent = '0'));
+    return;
+  }
   if (!project) {
     $('#board-name').textContent = 'No board yet';
     $('#view').innerHTML = emptyState(
@@ -707,6 +797,10 @@ async function pull({ background = true } = {}) {
   redraw();
   noticeNewTasks();
   scheduleReminders();
+  // A notification tap that arrived before the boards did.
+  if (pendingOpenTaskId && state.projects.length) {
+    const id = pendingOpenTaskId; pendingOpenTaskId = null; openTaskFromPush(id);
+  }
 }
 
 /**
@@ -1356,7 +1450,8 @@ $('#open-account').addEventListener('click', () => {
 });
 
 $('#signout-btn').addEventListener('click', async () => {
-  if (local.outbox.length) {
+  const keepCopy = bioOnFor(state.user?.id);   // locked behind the fingerprint, so it can stay
+  if (local.outbox.length && !keepCopy) {
     if (confirm(`${pendingText()} on this device. Sync them before signing out?`)) {
       try { await syncNow({ reason: 'signout' }); }
       catch (err) {
@@ -1364,10 +1459,11 @@ $('#signout-btn').addEventListener('click', async () => {
       }
     } else if (!confirm('Sign out and throw those changes away?')) return;
   }
-  await disablePush();
-  forgetLocal();
+  disablePush();
+  if (!keepCopy) forgetLocal();
   appVisible = false;
-  try { await api('/auth/signout', { method: 'POST' }); } catch { /* sign out locally anyway */ }
+  api('/auth/signout', { method: 'POST', background: true }).catch(() => { /* signed out here regardless */ });
+  sessionGetter = null;
   setToken(null);
   state.user = null;
   state.projects = [];
@@ -1885,12 +1981,12 @@ const bytesToB64 = (buf) =>
   btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 async function pushConfig() {
-  if (!pushCfg) pushCfg = await api('/push/config');
+  if (!pushCfg) pushCfg = await api('/push/config', { background: true });
   return pushCfg;
 }
 
 async function registerDevice(body) {
-  const out = await api('/push/subscribe', { method: 'POST', body });
+  const out = await api('/push/subscribe', { method: 'POST', body, background: true });
   // Sent back on every request, so adding a task for yourself on this device
   // buzzes your other devices but not this one.
   if (out?.id) localStorage.setItem('hb.pushDevice', out.id);
@@ -2161,14 +2257,14 @@ async function disablePush() {
   try {
     const token = localStorage.getItem('hb.fcmToken');
     if (token) {
-      await api('/push/unsubscribe', { method: 'POST', body: { kind: 'fcm', token } });
+      await api('/push/unsubscribe', { method: 'POST', body: { kind: 'fcm', token }, background: true });
       localStorage.removeItem('hb.fcmToken');
     }
     if (!isNativeApp() && 'serviceWorker' in navigator && 'PushManager' in window) {
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = await reg?.pushManager.getSubscription();
       if (sub) {
-        await api('/push/unsubscribe', { method: 'POST', body: { kind: 'web', subscription: sub.toJSON() } });
+        await api('/push/unsubscribe', { method: 'POST', body: { kind: 'web', subscription: sub.toJSON() }, background: true });
         await sub.unsubscribe();
       }
     }
@@ -2355,6 +2451,7 @@ $('#delete-account').addEventListener('click', async () => {
     const out = await api('/auth/me', { method: 'DELETE' });
     forgetLocal();
     bioOff({ server: false }); // the server already removed this account's keys
+    localStorage.removeItem(PW_KEY);
     appVisible = false;
     setToken(null);
     state.user = null;
@@ -2530,7 +2627,7 @@ async function bioEnroll() {
     body: { label: navigator.userAgent.slice(0, 80), replaces: old?.userId === state.user.id ? old.deviceId : undefined },
   });
   localStorage.setItem(BIO_KEY, JSON.stringify({
-    userId: state.user.id, email: state.user.email, name: state.user.name,
+    userId: state.user.id, email: state.user.email, name: state.user.name, user: state.user,
     kind, credId: credId || null, deviceId, secret,
   }));
 }
@@ -2544,14 +2641,46 @@ function bioOff({ server = true } = {}) {
 }
 
 /** Swap the device key for a fresh session. */
-async function bioSession(saved, { background = false } = {}) {
+async function bioSession(saved, { background = true } = {}) {
   try {
-    const out = await api('/auth/device/signin', { method: 'POST', background, body: { deviceId: saved.deviceId, secret: saved.secret } });
+    const out = await api('/auth/device/signin', {
+      method: 'POST', background, noSession: true, body: { deviceId: saved.deviceId, secret: saved.secret },
+    });
     if (out?.token) setToken(out.token);
+    if (out?.user?.id && state.user?.id === out.user.id) { state.user = out.user; saveLocal(); rememberBioUser(out.user); }
     return out;
   } catch (err) {
-    if (err.status === 401) { bioOff({ server: false }); updateBioUi(); }
+    if (err.status === 401) {
+      bioOff({ server: false });
+      updateBioUi();
+      if (state.user) signOutHere(err.message);
+    }
     throw err;
+  }
+}
+/** The fingerprint's way to get a session: swap the device key. */
+function bioGetter() {
+  return async () => { const saved = bioSaved(); if (saved?.deviceId) await bioSession(saved); };
+}
+function rememberBioUser(user) {
+  const saved = bioSaved();
+  if (saved && saved.userId === user.id) localStorage.setItem(BIO_KEY, JSON.stringify({ ...saved, user, name: user.name, email: user.email }));
+}
+
+/** End the session on this phone only and show sign-in, with a reason. */
+function signOutHere(message) {
+  setToken(null);
+  sessionGetter = null;
+  stopPolling();
+  appVisible = false;
+  state.user = null;
+  setAuthMode('signin');
+  showAuth();
+  if (message) {
+    const box = $('#auth-alert');
+    box.textContent = message;
+    box.className = 'alert alert-error';
+    box.classList.remove('hidden');
   }
 }
 
@@ -2589,7 +2718,7 @@ async function tryUnlock({ auto = false } = {}) {
     const done = unlockWaiter;
     unlockWaiter = null;
     // A fresh session from the device key — so an old one never runs out.
-    if (saved?.deviceId) bioSession(saved, { background: true }).catch(() => {});
+    if (saved?.deviceId) { sessionGetter = bioGetter(); bioSession(saved).catch(() => {}); }
     done?.();
   } catch (err) {
     const e = bioError(err);
@@ -2648,10 +2777,12 @@ async function bioSignin({ auto = false } = {}) {
   alert.classList.add('hidden');
   try {
     await bioCheck(saved.kind, saved.credId, 'Sign in to HomeBoard');
-    const out = await bioSession(saved);
-    if (!out?.user?.id) throw new Error('The server did not send an account back.');
-    state.user = out.user;
+    // In on the finger alone — the server session follows in the background.
+    setToken(null);
+    state.user = saved.user || { id: saved.userId, name: saved.name, email: saved.email };
+    sessionGetter = bioGetter();
     await boot();
+    sessionInBackground();
     handleJoinLink();
   } catch (err) {
     const e = err.status || err.offline ? { cancelled: false, text: err.message } : bioError(err);
@@ -2742,13 +2873,15 @@ async function boot() {
   rebuild();
   render();
   updateSyncUi();
+  // Nothing in boot waits for the server. The first download on a new phone,
+  // and the sync-on-open, both run behind the board.
   if (!local.base) {
-    await syncNow({ reason: 'first' });        // nothing here yet: we need one download
+    syncNow({ reason: 'first' }).catch((err) => { local.lastError = err.message; render(); });
   } else if (syncOnEdges()) {
     autoSync('open');
   }
   noticeNewTasks();
-  await consumePendingJoin();
+  consumePendingJoin();
   scheduleReminders();
   startPolling();
   // Straight after sign-in: ask for notification permission.
