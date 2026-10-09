@@ -52,10 +52,19 @@ app.use((req, res, next) => {
 
 app.use('/api', rateLimit({ windowMs: 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false }));
 
+// The app version this server is handing out — read from the page itself, so
+// there's one number to bump. Apps (the APK especially) compare against it.
+const APP_VERSION = (() => {
+  try {
+    const html = require('fs').readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    return (html.match(/<meta name="hb-version" content="([^"]+)"/) || [])[1] || null;
+  } catch { return null; }
+})();
+
 app.get('/api/health', (req, res) => {
   const p = push.config();
   res.json({
-    ok: true, app: 'HomeBoard', storage: store.MODE,
+    ok: true, app: 'HomeBoard', storage: store.MODE, appVersion: APP_VERSION,
     push: { web: Boolean(p.webPublicKey), fcm: p.fcm },
     time: new Date().toISOString(),
   });

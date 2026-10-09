@@ -495,3 +495,16 @@ main{flex:1;width:100%;max-width:760px;margin:0 auto;padding:16px 16px calc(96px
 .bio-signin .or{display:flex;align-items:center;gap:10px;color:var(--ink-3);font-size:12px;margin-bottom:14px}
 .bio-signin .or::before,.bio-signin .or::after{content:"";flex:1;height:1px;background:var(--line)}
 #bio-toggle:disabled{opacity:.45;cursor:not-allowed}
+
+/* ── repeat ── */
+.repeat-custom{margin-top:10px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2)}
+.repeat-every{display:flex;align-items:center;gap:9px;font-size:14px;color:var(--ink-2)}
+.repeat-every .input{width:72px;flex:0 0 auto;text-align:center}
+.repeat-every .select{flex:1}
+.repeat-days{display:flex;gap:6px;margin-top:10px}
+.repeat-days button{
+  flex:1;height:36px;border-radius:10px;border:1px solid var(--line);background:var(--surface);
+  font-weight:650;font-size:13px;color:var(--ink-2)
+}
+.repeat-days button[aria-pressed="true"]{background:var(--teal-700);border-color:var(--teal-700);color:#fff}
+.repeat-pill{color:var(--teal-700);font-weight:600}

@@ -2,9 +2,10 @@
    App shell is cached so it opens instantly and works offline.
    API calls always go to the network — task data must never be stale. */
 
-const VERSION = 'homeboard-v8';
+const VERSION = 'homeboard-v10';
 const SHELL = [
-  '/', '/index.html', '/app.css', '/app.js', '/qr.js', '/config.js', '/manifest.webmanifest',
+  // Versioned like the tags in index.html, so a cached page always gets its own matching code.
+  '/', '/index.html', '/app.css?v=10', '/app.js?v=10', '/qr.js?v=10', '/repeat.js?v=10', '/config.js', '/manifest.webmanifest',
   '/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon-32.png', '/icons/icon.svg',
 ];
 

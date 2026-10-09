@@ -6,6 +6,8 @@
 <title>HomeBoard — shared tasks for the people you live with</title>
 <meta name="description" content="Push to-dos to the people you live with. Shared boards, live countdowns, and details that delete themselves the moment a task is done.">
 <meta name="theme-color" content="#0f766e">
+<!-- App version. Bump this, every v= query below, and VERSION in sw.js together (scripts/version-check.js checks). -->
+<meta name="hb-version" content="10">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icons/icon-32.png" sizes="32x32">
 <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
@@ -16,7 +18,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;750&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/app.css?v=10">
 </head>
 <body>
 
@@ -134,6 +136,11 @@
       <button class="btn btn-primary btn-sm" id="bio-banner-on">Turn on</button>
       <button class="btn btn-ghost btn-sm" id="bio-banner-dismiss" aria-label="Dismiss">✕</button>
     </div>
+    <div id="update-banner" class="install hidden" role="status">
+      <img src="/icons/icon-192.png" alt="" width="34" height="34" style="border-radius:9px">
+      <p><strong>A newer HomeBoard is out</strong><br><span id="update-text">Update to get the latest features.</span></p>
+      <button class="btn btn-primary btn-sm" id="update-btn">Update</button>
+    </div>
     <div id="push-banner" class="install hidden" role="status">
       <img src="/icons/icon-192.png" alt="" width="34" height="34" style="border-radius:9px">
       <p><strong>Turn on notifications</strong><br><span id="push-banner-text">So you hear about new tasks the moment they are put on your plate.</span></p>
@@ -180,6 +187,34 @@
           <button type="button" data-days="7">Next week</button>
           <button type="button" data-clear="1">No deadline</button>
         </div>
+      </div>
+
+      <div class="field">
+        <span>Repeat</span>
+        <select class="select" id="repeat-preset">
+          <option value="none">Doesn't repeat</option>
+          <option value="daily">Every day</option>
+          <option value="weekdays">Every weekday (Mon–Fri)</option>
+          <option value="weekly">Every week</option>
+          <option value="fortnightly">Every 2 weeks</option>
+          <option value="monthly">Every month</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <div id="repeat-custom" class="repeat-custom hidden">
+          <div class="repeat-every">
+            <span>Every</span>
+            <input class="input" id="repeat-interval" type="number" min="1" max="99" value="1" inputmode="numeric">
+            <select class="select" id="repeat-unit">
+              <option value="day">day(s)</option>
+              <option value="week" selected>week(s)</option>
+              <option value="month">month(s)</option>
+            </select>
+          </div>
+          <div class="repeat-days" id="repeat-days" aria-label="On these days">
+            <button type="button" data-d="1">M</button><button type="button" data-d="2">T</button><button type="button" data-d="3">W</button><button type="button" data-d="4">T</button><button type="button" data-d="5">F</button><button type="button" data-d="6">S</button><button type="button" data-d="0">S</button>
+          </div>
+        </div>
+        <p class="hint hidden" id="repeat-hint"></p>
       </div>
 
       <div class="field">
@@ -436,7 +471,7 @@
       </p>
     </div>
     <p style="font-size:11.5px;color:var(--ink-3);text-align:center;margin:18px 0 0;line-height:1.6">
-      HomeBoard · when a task is marked done its details, steps and notes are deleted for good — only the name is kept.
+      HomeBoard <span id="app-version"></span> · when a task is marked done its details, steps and notes are deleted for good — only the name is kept.
     </p>
   </div>
 </section>
@@ -451,7 +486,8 @@
 </div>
 
 <script src="/config.js"></script>
-<script src="/qr.js"></script>
-<script src="/app.js"></script>
+<script src="/qr.js?v=10"></script>
+<script src="/repeat.js?v=10"></script>
+<script src="/app.js?v=10"></script>
 </body>
 </html>

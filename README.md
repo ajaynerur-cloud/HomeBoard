@@ -39,6 +39,10 @@ stays clean but you can still see who did what.
 - **Fingerprint unlock** — sign in with your password once, then open HomeBoard with your
   fingerprint. Native prompt in the APK, the phone's built-in authenticator in the browser.
 - **Details** — free-text notes, a checklist of steps, priority, and a due date with one-tap presets.
+- **Repeating tasks** — *Every day*, *Every weekday*, *Every week*, *Every 2 weeks*, *Every month*, or
+  *Custom* (every N days/weeks/months, on chosen weekdays). Marking one done logs it in Finished and
+  moves it to the next due date — details and steps stay (steps unticked), notes are cleared — and
+  its reminders come round again with it.
 - **Track** — tabs for *For me*, *Whole board*, *I assigned*, and *Finished*.
 - **Hand off** — reassign a task from inside it, or hand the whole board to someone else.
 - **Notes** — a comment thread per task, so "where's the key?" doesn't become a phone call.
@@ -73,6 +77,32 @@ What you see is always *last download + your unsent changes*, so a download neve
 - Boards, invites and members still need the server — they work online only.
 - Account → *How sync works* → **Save a copy of my data (JSON)** exports the local copy.
 - Signing out with unsynced changes offers to sync first.
+
+## Updating the app on phones
+
+The browser/PWA and the APK each run their own copy of the front end. After changing anything in
+`public/`, bump the version in **three places together** — `<meta name="hb-version">` and the `?v=`
+on the tags in `index.html`, and `VERSION` (plus the `?v=` list) in `sw.js` — and run
+`npm run version:check`. Then:
+
+- **Browser / installed PWA** — picks it up on the next open; if not, the app shows *A newer
+  HomeBoard is out → Update*.
+- **APK** — re-run **Build Android APK** and install it. Until then the app says it's out of date.
+
+## Repeating tasks
+
+Pick **Repeat** in the task form. The form previews the next three dates. Rules live on the task as
+`repeat: { unit: 'day'|'week'|'month', interval, days?, anchor }` and are worked out by
+`public/repeat.js`, shared by the app and the server:
+
+- The app works out the next date **in the phone's own time zone** and sends it with the
+  completion; the server checks it's after the current due date and within a year, or works it out
+  itself for older apps.
+- Missed a few? Finishing a daily task three days late moves it to the next one still to come, not
+  to three stale ones.
+- Monthly on the 31st falls on the last day of shorter months, then goes back to the 31st.
+- Undo works, before or after syncing — it moves the task back.
+- No due date picked? It starts today at 6pm (tomorrow if that has passed).
 
 ## Signing in never waits for the server
 
@@ -451,6 +481,9 @@ npm run test:reminders  # the Android reminder flow against a stand-in plugin �
 npm run test:sync    # offline-first: offline edits, offline reopen, manual sync, conflicts
 npm run test:fingerprint  # WebAuthn virtual authenticator + stand-in native plugin
 npm run test:login   # sign-in with the API playing dead: no waiting, no waking screen
+npm run test:repeat  # repeat rules (run with TZ= a few zones) + repeating tasks in the browser
+npm run test:update  # an out-of-date app says so
+npm run version:check  # index.html and sw.js agree on the app version — run after any front-end change
 npm run test:ui      # 45 real browser assertions through the whole UI
                      # (needs: npm i --no-save playwright && npx playwright install chromium)
 ```
@@ -500,7 +533,7 @@ All endpoints under `/api`. Auth is a `Bearer` token or the `hb_token` cookie.
 | `POST` | `/tasks` | create / push to someone (accepts the app's own `id`, idempotent) |
 | `PATCH` | `/tasks/:id` | edit, reassign, tick a step |
 | `POST` | `/tasks/:id/comments` | add a note |
-| `POST` | `/tasks/:id/complete` | **delete the task**, keep a name-only record |
+| `POST` | `/tasks/:id/complete` | **delete the task**, keep a name-only record — or, if it repeats, move it to `nextDueAt` |
 | `POST` | `/tasks/restore` | undo a completion (the task comes back from the client) |
 | `DELETE` | `/tasks/:id` | delete with no record |
 | `GET` | `/tasks/history/list` | what's been finished |

@@ -67,4 +67,38 @@ fingerprint plugin was added cannot read fingerprints, and Account → Fingerpri
 - With fingerprint on, signing out keeps the local copy on the phone.
 
 Files this round: `public/app.js`, `public/sw.js` (v8), `package.json`, `scripts/login-test.js` (new, 16),
-`README.md`, `CHANGED.md`. No server change; no APK rebuild needed beyond round 2's.
+`README.md`, `CHANGED.md`. No server change. The APK carries its own copy of the app, so **re-run
+Build Android APK** to get this on the phone app.
+
+## Round 4 — repeating tasks (daily, weekly, recurring reminders)
+
+- **Repeat** in the task form: every day · every weekday · every week · every 2 weeks · every month ·
+  custom (every N days/weeks/months, pick weekdays). Live preview of the next 3 dates.
+- Done → a line in Finished, and the task moves to its next date (steps unticked, details kept,
+  notes cleared). Reminders follow it, so a daily task reminds you daily.
+- ↻ on the card and in the task view. Works offline; Undo works before or after syncing.
+- A sync no longer hides an Undo that's still on screen.
+
+Files this round: `public/repeat.js` (new, shared with the server), `public/app.js`, `public/index.html`,
+`public/app.css`, `public/sw.js` (v9), `server/routes/tasks.js`, `package.json`,
+`scripts/repeat-rules-test.js` (new, 18), `scripts/repeat-test.js` (new, 23), `README.md`, `CHANGED.md`.
+The APK carries its own copy of the app, so **re-run Build Android APK** and reinstall to get this on
+the phone app (the browser/PWA picks it up on its own).
+
+## Round 5 — "I don't see Repeat"
+
+The phone was running an older copy of the app. The APK carries its own copy, and a browser
+serves the one its service worker cached — so a server update alone doesn't reach it.
+
+- **Account** footer now shows the app version (e.g. `v10`), and the server's if they differ.
+- After a sync, an out-of-date app shows **"A newer HomeBoard is out"** — in the browser with an
+  **Update** button; in the APK telling you to install the new APK.
+- Page and code are now cached as a matching pair (`?v=10`), so a phone can never mix an old page
+  with new code. `npm run version:check` keeps the three version numbers in step.
+
+Files this round: `public/index.html`, `public/app.js`, `public/sw.js` (v10), `server/index.js`
+(`/api/health` reports `appVersion`), `package.json`, `scripts/version-check.js` (new),
+`scripts/update-test.js` (new), `CHANGED.md`.
+
+**To see Repeat on the phone:** push, then **GitHub → Actions → Build Android APK → Run workflow**,
+download the new APK and install it over the old one.

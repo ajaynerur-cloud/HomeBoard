@@ -423,6 +423,7 @@ function taskCard(task) {
   const bits = [];
   bits.push(`<span class="who">${avatar(task.assignee, 'sm')}${esc(mine ? 'You' : task.assignee?.name || 'Unassigned')}</span>`);
   bits.push(`<span class="dot"></span><span class="remaining pill pill-${r.tone}" data-due="${esc(task.dueAt || '')}">${esc(r.text)}</span>`);
+  if (task.repeat) bits.push(`<span class="dot"></span><span class="has-details repeat-pill" title="Repeats">↻ ${esc(Repeat.describe(task.repeat))}</span>`);
   if (steps) bits.push(`<span class="dot"></span><span class="has-details">☑ ${doneSteps}/${steps}</span>`);
   if (task.details) bits.push(`<span class="dot"></span><span class="has-details">≡ details</span>`);
   if (notes) bits.push(`<span class="dot"></span><span class="has-details">💬 ${notes}</span>`);
@@ -432,7 +433,7 @@ function taskCard(task) {
   // No tick on the card. Tapping opens the task so it can be read before it is
   // marked done — completing wipes the details, so it should never be one
   // stray thumb away.
-  const initial = task.priority === 'high' ? '!' : (task.checklist || []).length ? '☰' : '·';
+  const initial = task.priority === 'high' ? '!' : task.repeat ? '↻' : (task.checklist || []).length ? '☰' : '·';
 
   return `
     <div class="task pri-${esc(task.priority)}${r.ms < 0 ? ' overdue' : ''}" data-id="${esc(task.id)}">
@@ -658,12 +659,22 @@ function applyOp(tasks, history, op) {
     }
     case 'complete': {
       const i = tasks.findIndex((t) => t.id === op.taskId);
-      if (i !== -1) tasks.splice(i, 1);
+      if (i !== -1 && op.nextDueAt && tasks[i].repeat) {
+        // Repeating: it moves on rather than going away.
+        const t = tasks[i];
+        if (Date.parse(t.dueAt) < Date.parse(op.nextDueAt)) {
+          t.dueAt = op.nextDueAt;
+          t.checklist = (t.checklist || []).map((c) => ({ ...c, done: false }));
+          t.comments = [];
+        }
+      } else if (i !== -1) tasks.splice(i, 1);
       if (!history.some((h) => h.id === op.history.id)) history.unshift({ ...op.history, completedBy: state.user });
       break;
     }
     case 'restore': {
-      if (!find(op.task.id)) tasks.push(clone(op.task));
+      const at = tasks.findIndex((t) => t.id === op.task.id);
+      if (at === -1) tasks.push(clone(op.task));
+      else if (tasks[at].repeat) tasks[at] = clone(op.task);
       const i = history.findIndex((h) => h.id === op.historyId);
       if (i !== -1) history.splice(i, 1);
       break;
@@ -753,7 +764,7 @@ async function sendOp(op) {
       const t = op.task;
       return api('/tasks', { ...opts, method: 'POST', body: {
         id: t.id, projectId: t.projectId, title: t.title, details: t.details, checklist: t.checklist,
-        assigneeId: t.assigneeId, dueAt: t.dueAt, priority: t.priority, createdAt: t.createdAt,
+        assigneeId: t.assigneeId, dueAt: t.dueAt, priority: t.priority, createdAt: t.createdAt, repeat: t.repeat || null,
       } });
     }
     case 'update':
@@ -762,7 +773,7 @@ async function sendOp(op) {
       return api(`/tasks/${encodeURIComponent(op.taskId)}/comments`, { ...opts, method: 'POST', body: op.comment });
     case 'complete':
       return api(`/tasks/${encodeURIComponent(op.taskId)}/complete`, { ...opts, method: 'POST', body: {
-        historyId: op.history.id, completedAt: op.history.completedAt,
+        historyId: op.history.id, completedAt: op.history.completedAt, nextDueAt: op.nextDueAt || undefined,
       } });
     case 'restore':
       return api('/tasks/restore', { ...opts, method: 'POST', body: { task: op.task, historyId: op.historyId } });
@@ -797,6 +808,7 @@ async function pull({ background = true } = {}) {
   redraw();
   noticeNewTasks();
   scheduleReminders();
+  checkForUpdate();
   // A notification tap that arrived before the boards did.
   if (pendingOpenTaskId && state.projects.length) {
     const id = pendingOpenTaskId; pendingOpenTaskId = null; openTaskFromPush(id);
@@ -862,8 +874,10 @@ async function syncAndReport() {
       console.warn('[HomeBoard] changes the server refused:', out.dropped);
       return;
     }
-    // Don't talk over a "New task from…" alert the sync just raised.
+    // Don't talk over a "New task from…" alert the sync just raised, or take
+    // away an Undo that is still on screen.
     if ($('#toast-text').textContent !== before && $('#toast').classList.contains('show')) return;
+    if ($('#toast').classList.contains('show') && !$('#toast-action').classList.contains('hidden')) return;
     toast(out.sent ? `Synced — ${out.sent} change${out.sent === 1 ? '' : 's'} sent.` : 'Up to date.');
   } catch (err) {
     toast(err.offline
@@ -935,6 +949,45 @@ window.addEventListener('offline', () => updateSyncUi());
 
 /* Board-level actions still need the server; afterwards, refresh the copy. */
 async function loadAll() { await pull({ background: false }); }
+
+/* ── is this copy of the app the latest? ── */
+
+/*
+ * The APK carries its own copy of the app, and a browser serves the copy its
+ * service worker cached. Both can quietly be a version behind the server — new
+ * features then simply aren't there. After a sync, compare with the server and
+ * say so, with a way to fix it.
+ */
+const APP_VERSION = document.querySelector('meta[name="hb-version"]')?.content || '?';
+let versionCheckedAt = 0;
+async function checkForUpdate() {
+  if (Date.now() - versionCheckedAt < 30 * 60 * 1000) return;
+  versionCheckedAt = Date.now();
+  let server = null;
+  try { server = (await api('/health', { background: true, noSession: true }))?.appVersion; } catch { return; }
+  const el = $('#app-version');
+  if (el) el.textContent = server && server !== APP_VERSION ? `v${APP_VERSION} (server v${server})` : `v${APP_VERSION}`;
+  const behind = server && Number(server) > Number(APP_VERSION);
+  $('#update-banner')?.classList.toggle('hidden', !behind);
+  if (behind) {
+    $('#update-text').textContent = inApk()
+      ? `This app is v${APP_VERSION}; v${server} is out. Install the new APK (GitHub → Actions → Build Android APK).`
+      : `You have v${APP_VERSION}; v${server} is out. Tap Update.`;
+    $('#update-btn').classList.toggle('hidden', inApk());
+  }
+}
+
+$('#update-btn').addEventListener('click', async () => {
+  $('#update-btn').disabled = true;
+  try {
+    // Fetch the new worker, let it take over, and start clean from its cache.
+    const reg = await navigator.serviceWorker?.getRegistration();
+    await reg?.update();
+    const keys = await caches?.keys?.() || [];
+    await Promise.all(keys.map((k) => caches.delete(k)));
+  } catch { /* reload anyway */ }
+  location.reload();
+});
 
 /** A push says something changed on the server. */
 function serverChanged() {
@@ -1016,7 +1069,7 @@ $('.quick', $('#task-form')).addEventListener('click', (e) => {
   const btn = e.target.closest('button');
   if (!btn) return;
   const input = $('#task-form [name=dueAt]');
-  if (btn.dataset.clear) { input.value = ''; return; }
+  if (btn.dataset.clear) { input.value = ''; renderRepeat(); return; }
   const d = new Date();
   if (btn.dataset.in)      d.setHours(d.getHours() + Number(btn.dataset.in));
   if (btn.dataset.tonight) d.setHours(20, 0, 0, 0);
@@ -1025,7 +1078,76 @@ $('.quick', $('#task-form')).addEventListener('click', (e) => {
     d.setHours(18, 0, 0, 0);
   }
   input.value = toLocalInput(d.toISOString());
+  renderRepeat();
 });
+
+/* ── Repeat ── */
+
+const Repeat = window.HomeBoardRepeat;
+let customDays = [];
+
+function dueFromForm() {
+  const v = $('#task-form [name=dueAt]').value;
+  return v ? new Date(v).toISOString() : null;
+}
+
+/** The rule the form describes right now, or null. */
+function repeatFromForm() {
+  const preset = $('#repeat-preset').value;
+  if (preset === 'none') return null;
+  const due = dueFromForm();
+  if (preset !== 'custom') return Repeat.PRESETS[preset](due);
+  const unit = $('#repeat-unit').value;
+  const rule = { unit, interval: Number($('#repeat-interval').value) || 1 };
+  if (unit === 'week') rule.days = customDays.length ? [...customDays] : [new Date(due || Date.now()).getDay()];
+  return Repeat.sanitise(rule);
+}
+
+function renderRepeat() {
+  const preset = $('#repeat-preset').value;
+  const custom = preset === 'custom';
+  $('#repeat-custom').classList.toggle('hidden', !custom);
+  $('#repeat-days').classList.toggle('hidden', !(custom && $('#repeat-unit').value === 'week'));
+  $$('#repeat-days button').forEach((b) => b.setAttribute('aria-pressed', String(customDays.includes(Number(b.dataset.d)))));
+
+  const hint = $('#repeat-hint');
+  const rule = repeatFromForm();
+  if (!rule) { hint.classList.add('hidden'); return; }
+  const due = dueFromForm();
+  hint.classList.remove('hidden');
+  if (!due) {
+    hint.textContent = `${Repeat.describe(rule)}. Pick a time above — or it starts today at 6pm.`;
+    return;
+  }
+  const fmt = (iso) => new Date(iso).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+  hint.innerHTML = `<strong>${esc(Repeat.describe(rule))}.</strong> Next: ${Repeat.upcoming(due, rule, 3).map((d) => esc(fmt(d))).join(' · ')}. ` +
+    'Marking it done moves it to the next one; the details and steps stay, notes are cleared.';
+}
+
+$('#repeat-preset').addEventListener('change', () => {
+  if ($('#repeat-preset').value === 'custom' && !customDays.length) customDays = [new Date(dueFromForm() || Date.now()).getDay()];
+  renderRepeat();
+});
+$('#repeat-unit').addEventListener('change', renderRepeat);
+$('#repeat-interval').addEventListener('input', renderRepeat);
+$('#task-form [name=dueAt]').addEventListener('input', renderRepeat);
+$('#repeat-days').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const d = Number(btn.dataset.d);
+  customDays = customDays.includes(d) ? customDays.filter((x) => x !== d) : [...customDays, d];
+  renderRepeat();
+});
+
+function fillRepeat(task) {
+  const rule = Repeat.sanitise(task?.repeat);
+  const preset = rule ? Repeat.presetOf(rule, task.dueAt) : 'none';
+  $('#repeat-preset').value = preset;
+  $('#repeat-interval').value = String(rule?.interval || 1);
+  $('#repeat-unit').value = rule?.unit || 'week';
+  customDays = rule?.days ? [...rule.days] : [];
+  renderRepeat();
+}
 
 function openTaskSheet(task = null) {
   if (!activeProject()) { sheet('#sheet-boards'); return; }
@@ -1046,6 +1168,7 @@ function openTaskSheet(task = null) {
 
   const pri = task?.priority || 'normal';
   $$('#priority-seg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === pri)));
+  fillRepeat(task);
 
   sheet('#sheet-task');
   setTimeout(() => form.elements.title.focus(), 280);
@@ -1060,6 +1183,25 @@ $('#task-save').addEventListener('click', () => {
 
   const assigneeId = $('#assignee-picker .person[aria-pressed="true"]')?.dataset.uid || state.user.id;
   const priority = $('#priority-seg button[aria-pressed="true"]')?.dataset.v || 'normal';
+
+  // A repeating task needs a time to repeat from: today at 6pm (or tomorrow if that's gone).
+  let repeat = repeatFromForm();
+  if (repeat && !form.elements.dueAt.value) {
+    const d = new Date();
+    d.setHours(18, 0, 0, 0);
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+    form.elements.dueAt.value = toLocalInput(d.toISOString());
+    repeat = repeatFromForm();
+  }
+  if (repeat) {
+    // Counted from the first due date. Same rule and same date as before? Keep counting from where it started.
+    const due = new Date(form.elements.dueAt.value).toISOString();
+    const was = state.editing?.repeat;
+    const same = was?.anchor && state.editing.dueAt === due
+      && JSON.stringify({ ...was, anchor: undefined }) === JSON.stringify({ ...repeat, anchor: undefined });
+    repeat.anchor = same ? was.anchor : due;
+  }
+
   const payload = {
     projectId: activeProject().id,
     title,
@@ -1067,6 +1209,7 @@ $('#task-save').addEventListener('click', () => {
     dueAt: form.elements.dueAt.value ? new Date(form.elements.dueAt.value).toISOString() : null,
     assigneeId,
     priority,
+    repeat,
     checklist: state.draftChecks
       .filter((c) => c.text.trim())
       .map((c) => ({ id: c.id || rid('chk'), text: c.text.trim().slice(0, 200), done: Boolean(c.done) })),
@@ -1076,7 +1219,7 @@ $('#task-save').addEventListener('click', () => {
   const editing = state.editing;
   if (editing) {
     const patch = {};
-    for (const k of ['title', 'details', 'dueAt', 'assigneeId', 'priority', 'checklist']) {
+    for (const k of ['title', 'details', 'dueAt', 'assigneeId', 'priority', 'checklist', 'repeat']) {
       if (JSON.stringify(payload[k] ?? null) !== JSON.stringify(editing[k] ?? null)) patch[k] = payload[k];
     }
     if (Object.keys(patch).length) queue({ type: 'update', taskId: editing.id, patch });
@@ -1093,6 +1236,7 @@ $('#task-save').addEventListener('click', () => {
   const who = activeProject().members.find((m) => m.user.id === assigneeId)?.user;
   toast(
     editing ? 'Task updated.'
+    : repeat ? `Added — repeats: ${Repeat.describe(repeat)}.`
     : assigneeId === state.user.id ? 'Added to your list.'
     : `Saved for ${who?.name?.split(' ')[0] || 'them'} — they get it when you sync.`,
     { label: 'Sync now', run: syncAndReport }
@@ -1114,6 +1258,7 @@ function renderDetail() {
       <span class="pill pill-${r.tone}">${esc(r.text)}</span>
       ${task.priority === 'high' ? '<span class="pill pill-danger">High priority</span>' : ''}
       ${task.priority === 'low' ? '<span class="pill pill-mute">Low priority</span>' : ''}
+      ${task.repeat ? `<span class="pill pill-mute repeat-pill">↻ ${esc(Repeat.describe(task.repeat))}</span>` : ''}
       ${task.dueAt ? `<span class="pill pill-mute">Due ${esc(new Date(task.dueAt).toLocaleString(undefined,{weekday:'short',day:'numeric',month:'short',hour:'numeric',minute:'2-digit'}))}</span>` : ''}
     </div>
 
@@ -1221,8 +1366,9 @@ async function completeTask(id, title) {
   // Kept in this closure only, for Undo. Once the toast goes, it really is gone.
   const before = rawTask(clone(task));
   const completedAt = new Date().toISOString();
+  const nextDueAt = task.repeat ? Repeat.next(task.dueAt, task.repeat) : null;
   const op = {
-    type: 'complete', taskId: id,
+    type: 'complete', taskId: id, nextDueAt,
     history: {
       id: rid('hst'), projectId: task.projectId, title: task.title, completedById: state.user.id,
       assignedToId: task.assigneeId || null, completedAt,
@@ -1230,7 +1376,10 @@ async function completeTask(id, title) {
     },
   };
   queue(op);
-  toast(`“${title}” done.`, {
+  const nextText = nextDueAt
+    ? ` Next one ${new Date(nextDueAt).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}.`
+    : '';
+  toast(`“${title}” done.${nextText}`, {
     label: 'Undo',
     run: () => {
       if (local.outbox.includes(op) && !op.sending) {
@@ -1434,6 +1583,7 @@ $('#theme-seg').addEventListener('click', (e) => {
 });
 
 $('#open-account').addEventListener('click', () => {
+  if (!$('#app-version').textContent) $('#app-version').textContent = `v${APP_VERSION}`;
   $('#sync-every').value = String(syncEvery());
   $('#sync-edges').checked = syncOnEdges();
   updateSyncUi();
@@ -1722,7 +1872,8 @@ async function scheduleReminders() {
           }
         }
 
-        notifications.push(notificationFor(t, BAND_DUE, new Date(due), 'Due now.'));
+        notifications.push(notificationFor(t, BAND_DUE, new Date(due),
+          t.repeat ? `Due now · ↻ ${Repeat.describe(t.repeat)}` : 'Due now.'));
       }
 
       if (notifications.length) await ln.schedule({ notifications });

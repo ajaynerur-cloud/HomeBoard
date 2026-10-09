@@ -21,7 +21,10 @@
     "test:push": "node scripts/push-test.js",
     "test:sync": "node scripts/sync-test.js",
     "test:fingerprint": "node scripts/fingerprint-test.js",
-    "test:login": "node scripts/login-test.js"
+    "test:login": "node scripts/login-test.js",
+    "test:repeat": "node scripts/repeat-rules-test.js && node scripts/repeat-test.js",
+    "test:update": "node scripts/update-test.js",
+    "version:check": "node scripts/version-check.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

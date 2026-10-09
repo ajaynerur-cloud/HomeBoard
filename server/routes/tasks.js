@@ -3,6 +3,7 @@ const express = require('express');
 const store = require('../store');
 const { newId, requireAuth, publicUser } = require('../auth');
 const push = require('../push');
+const Repeat = require('../../public/repeat');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -123,6 +124,7 @@ router.post('/', async (req, res, next) => {
       createdById: req.user.id,
       dueAt: sanitiseDue(req.body?.dueAt),
       priority: PRIORITIES.includes(req.body?.priority) ? req.body.priority : 'normal',
+      repeat: Repeat.sanitise(req.body?.repeat),
       comments: [],
       createdAt: clientTime(req.body?.createdAt) || now,
       updatedAt: now,
@@ -167,6 +169,7 @@ router.patch('/:id', async (req, res, next) => {
       if (body.assigneeId !== undefined) t.assigneeId = body.assigneeId ? String(body.assigneeId) : null;
       if (body.dueAt !== undefined) t.dueAt = sanitiseDue(body.dueAt);
       if (body.priority !== undefined && PRIORITIES.includes(body.priority)) t.priority = body.priority;
+      if (body.repeat !== undefined) t.repeat = Repeat.sanitise(body.repeat);
       t.updatedAt = new Date().toISOString();
       return { task: t };
     }, `HomeBoard: update task`);
@@ -245,10 +248,34 @@ router.post('/:id/complete', async (req, res, next) => {
       wasLate: existing.dueAt ? Date.parse(completedAt) > Date.parse(existing.dueAt) : false,
     };
 
+    /*
+     * A repeating task isn't deleted — it rolls on to its next due date, steps
+     * unticked and notes cleared, ready for next time. The app works the date
+     * out in its own time zone and sends it; we check it's sane, and fall back
+     * to working it out here (in server time) for older apps.
+     */
+    let nextDueAt = null;
+    if (existing.repeat) {
+      const sent = Date.parse(req.body?.nextDueAt);
+      const floor = Math.max(Date.parse(existing.dueAt) || 0, Date.parse(completedAt) - 60 * 1000);
+      nextDueAt = Number.isFinite(sent) && sent > floor && sent < Date.now() + 400 * 24 * 3600 * 1000
+        ? new Date(sent).toISOString()
+        : Repeat.next(existing.dueAt, existing.repeat, { after: Date.parse(completedAt) });
+    }
+
     await store.update('tasks', (rows) => {
       const i = rows.findIndex((x) => x.id === req.params.id);
-      if (i !== -1) rows.splice(i, 1);
-    }, `HomeBoard: completed + purged "${existing.title}"`);
+      if (i === -1) return;
+      if (nextDueAt) {
+        const t = rows[i];
+        t.dueAt = nextDueAt;
+        t.checklist = (t.checklist || []).map((c) => ({ ...c, done: false }));
+        t.comments = [];
+        t.updatedAt = new Date().toISOString();
+      } else {
+        rows.splice(i, 1);
+      }
+    }, nextDueAt ? `HomeBoard: "${existing.title}" done — next one ${nextDueAt}` : `HomeBoard: completed + purged "${existing.title}"`);
 
     await store.update('history', (rows) => {
       rows.push(entry);
@@ -265,7 +292,8 @@ router.post('/:id/complete', async (req, res, next) => {
     const byId = new Map(users.map((u) => [u.id, u]));
     res.json({
       ok: true,
-      purged: true,
+      purged: !nextDueAt,
+      nextDueAt,
       history: { ...entry, completedBy: publicUser(byId.get(entry.completedById)) },
       // Handed back so the app can offer an Undo. It is not stored anywhere
       // once this response is sent — if the app doesn't use it, it's gone.
@@ -334,7 +362,10 @@ router.post('/restore', async (req, res, next) => {
     if (error) return res.status(error.code).json({ error: error.message });
 
     const out = await store.update('tasks', (rows) => {
-      if (rows.some((t) => t.id === task.id)) return { code: 409, error: 'That task is already on the board.' };
+      const i = rows.findIndex((t) => t.id === task.id);
+      // A repeating task stayed on the board and moved on — undo moves it back.
+      if (i !== -1 && rows[i].repeat) { rows[i] = { ...task, updatedAt: new Date().toISOString() }; return { ok: true }; }
+      if (i !== -1) return { code: 409, error: 'That task is already on the board.' };
       rows.push({ ...task, updatedAt: new Date().toISOString() });
       return { ok: true };
     }, `HomeBoard: restored "${String(task.title || '').slice(0, 60)}"`);
