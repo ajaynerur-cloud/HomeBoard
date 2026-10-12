@@ -18,6 +18,7 @@ const state = {
   detailId: null,
   draftChecks: [],
 };
+let histSelect = null; // Set of Finished ids while "Select" mode is on, else null
 
 const activeProject = () =>
   state.projects.find((p) => p.id === state.activeId) || state.projects[0] || null;
@@ -491,16 +492,29 @@ function render() {
 
   if (state.view === 'done') {
     const rows = state.history.filter((h) => h.projectId === project.id);
+    const sel = histSelect;
+    if (sel) for (const id of [...sel]) if (!rows.some((h) => h.id === id)) sel.delete(id);
     view.innerHTML = rows.length
       ? `<p style="font-size:12.5px;color:var(--ink-3);margin:2px 4px 12px;line-height:1.6">
            Details, steps and notes were deleted when each of these was finished. Only the name stays.
          </p>
+         <div class="hist-bar">${sel
+           ? `<button class="btn btn-ghost btn-sm" data-hist="toggle-all">${sel.size === rows.length ? 'Select none' : 'Select all'}</button>
+              <span class="hist-count">${sel.size} selected</span>
+              <button class="btn btn-ghost btn-sm" data-hist="cancel">Cancel</button>
+              <button class="btn btn-danger btn-sm" data-hist="delete-selected" ${sel.size ? '' : 'disabled'}>Delete</button>`
+           : `<span class="hist-count">${rows.length} finished</span>
+              <button class="btn btn-ghost btn-sm" data-hist="select">Select</button>
+              <button class="btn btn-ghost btn-sm hist-danger" data-hist="clear-all">Clear all</button>`}
+         </div>
          <div class="task-list">${rows.map((h) => `
-           <div class="hist">
+           <div class="hist${sel?.has(h.id) ? ' selected' : ''}" ${sel ? `data-hist-pick="${esc(h.id)}" role="checkbox" aria-checked="${sel.has(h.id)}" tabindex="0"` : ''}>
+             ${sel ? `<span class="hist-check" aria-hidden="true">${sel.has(h.id) ? '✓' : ''}</span>` : ''}
              ${avatar(h.completedBy, 'sm')}
              <span class="ttl">${esc(h.title)}</span>
              ${h.wasLate ? '<span class="pill pill-warn">late</span>' : ''}
              <span class="when">${esc(ago(h.completedAt))}</span>
+             ${sel ? '' : `<button class="hist-del" data-hist-del="${esc(h.id)}" title="Delete" aria-label="Delete “${esc(h.title)}” from Finished">✕</button>`}
            </div>`).join('')}</div>`
       : emptyState('Nothing finished yet', 'Completed tasks show up here by name — everything else about them gets deleted.');
     return;
@@ -684,6 +698,11 @@ function applyOp(tasks, history, op) {
       if (i !== -1) tasks.splice(i, 1);
       break;
     }
+    case 'history-delete': {
+      const ids = new Set(op.historyIds);
+      for (let i = history.length - 1; i >= 0; i--) if (ids.has(history[i].id)) history.splice(i, 1);
+      break;
+    }
   }
 }
 
@@ -779,14 +798,17 @@ async function sendOp(op) {
       return api('/tasks/restore', { ...opts, method: 'POST', body: { task: op.task, historyId: op.historyId } });
     case 'delete':
       return api(`/tasks/${encodeURIComponent(op.taskId)}`, { ...opts, method: 'DELETE' });
+    case 'history-delete':
+      return api('/tasks/history/delete', { ...opts, method: 'POST', body: { ids: op.historyIds } });
   }
   return null;
 }
 
 const OP_LABEL = {
-  create: 'adding', update: 'editing', comment: 'a note on', complete: 'finishing', restore: 'putting back', delete: 'deleting',
+  create: 'adding', update: 'editing', comment: 'a note on', complete: 'finishing', restore: 'putting back', delete: 'deleting', 'history-delete': 'clearing',
 };
 function opTitle(op) {
+  if (op.type === 'history-delete') return `${op.historyIds.length} finished`;
   return op.task?.title || op.history?.title || state.tasks.find((t) => t.id === op.taskId)?.title
     || local.base?.tasks?.find((t) => t.id === op.taskId)?.title || 'a task';
 }
@@ -1002,6 +1024,7 @@ $$('.tabs button').forEach((btn) => {
   btn.addEventListener('click', () => {
     $$('.tabs button').forEach((b) => b.setAttribute('aria-selected', String(b === btn)));
     state.view = btn.dataset.view;
+    histSelect = null;
     render();
   });
 });
@@ -1397,6 +1420,67 @@ async function completeTask(id, title) {
 $('#view').addEventListener('click', (e) => {
   const open = e.target.closest('[data-open]');
   if (open) openDetail(open.dataset.open);
+});
+
+/* ── deleting finished entries (one, selected, or all) ── */
+
+function deleteHistory(ids) {
+  if (!ids.length) return;
+  const op = { type: 'history-delete', historyIds: ids };
+  queue(op);
+  toast(ids.length === 1 ? 'Removed from Finished.' : `${ids.length} removed from Finished.`, {
+    label: 'Undo',
+    run: () => {
+      if (local.outbox.includes(op) && !op.sending) {
+        local.outbox = local.outbox.filter((o) => o !== op);
+        commitLocal();
+        toast('Put back.');
+      } else toast('Already synced — cannot undo.');
+    },
+  });
+}
+
+$('#view').addEventListener('click', (e) => {
+  const del = e.target.closest('[data-hist-del]');
+  if (del) { e.stopPropagation(); deleteHistory([del.dataset.histDel]); return; }
+
+  const pick = e.target.closest('[data-hist-pick]');
+  if (pick && histSelect) {
+    const id = pick.dataset.histPick;
+    histSelect.has(id) ? histSelect.delete(id) : histSelect.add(id);
+    render();
+    return;
+  }
+
+  const act = e.target.closest('[data-hist]');
+  if (!act) return;
+  const rows = state.history.filter((h) => h.projectId === activeProject()?.id);
+  switch (act.dataset.hist) {
+    case 'select': histSelect = new Set(); break;
+    case 'cancel': histSelect = null; break;
+    case 'toggle-all':
+      histSelect = histSelect.size === rows.length ? new Set() : new Set(rows.map((h) => h.id));
+      break;
+    case 'delete-selected': {
+      const ids = [...histSelect];
+      if (!ids.length) return;
+      if (ids.length > 1 && !confirm(`Delete ${ids.length} entries from Finished for everyone on this board?`)) return;
+      histSelect = null;
+      deleteHistory(ids);
+      return;
+    }
+    case 'clear-all': {
+      if (!rows.length) return;
+      if (!confirm(`Clear all ${rows.length} finished entries for everyone on this board?`)) return;
+      deleteHistory(rows.map((h) => h.id));
+      return;
+    }
+  }
+  render();
+});
+
+$('#view').addEventListener('keydown', (e) => {
+  if ((e.key === ' ' || e.key === 'Enter') && e.target.matches('[data-hist-pick]')) { e.preventDefault(); e.target.click(); }
 });
 
 /* ───────────────────────── boards ───────────────────────── */

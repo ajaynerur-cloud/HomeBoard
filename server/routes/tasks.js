@@ -348,6 +348,42 @@ router.get('/history/list', async (req, res, next) => {
 });
 
 /**
+ * Delete finished entries — one, several, or a whole board's worth.
+ * Body: { ids: ['hst_…', …] } or { projectId, all: true }.
+ * Only lines on boards you belong to are touched. Idempotent: ids already
+ * gone are simply skipped, so a replayed sync is harmless.
+ */
+router.post('/history/delete', async (req, res, next) => {
+  try {
+    const projects = await store.read('projects');
+    const myProjectIds = new Set(
+      projects.filter((p) => p.members.some((m) => m.userId === req.user.id)).map((p) => p.id)
+    );
+    const body = req.body || {};
+    let match;
+    if (body.all === true) {
+      const pid = String(body.projectId || '');
+      if (!myProjectIds.has(pid)) return res.status(403).json({ error: 'You are not on this board.' });
+      match = (h) => h.projectId === pid;
+    } else {
+      const ids = new Set((Array.isArray(body.ids) ? body.ids : []).slice(0, 1000)
+        .map((id) => clientId(id, 'hst')).filter(Boolean));
+      if (!ids.size) return res.status(400).json({ error: 'Nothing to delete.' });
+      match = (h) => ids.has(h.id) && myProjectIds.has(h.projectId);
+    }
+
+    const removed = await store.update('history', (rows) => {
+      let n = 0;
+      for (let i = rows.length - 1; i >= 0; i--) if (match(rows[i])) { rows.splice(i, 1); n++; }
+      return n;
+    }, 'HomeBoard: finished entries deleted');
+    res.json({ ok: true, removed });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * Undo a completion: put the task back exactly as it was and remove the
  * history line. Only works while the app still holds the task it was given
  * back — nothing is kept server-side after the completion response.
